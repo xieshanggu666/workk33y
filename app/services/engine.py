@@ -7,6 +7,7 @@
 """
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from ..models import GameSession, Resident, Facility, EventLog
 from ..core.config import INITIAL_RESOURCES, SURVIVAL_TARGET_DAY
@@ -47,6 +48,40 @@ EXPEDITION_SUPPLY_PER_DAY = {FOOD: 1.0, WATER: 1.0}  # 每人每日消耗自带�
 EXPEDITION_MAX_DAYS = 7       # 最长探索天数，期满强制返程
 EXPEDITION_ENCOUNTER_CHANCE = 0.85  # 每日行军遭遇概率
 EXPEDITION_MAX_MEMBERS = 4    # 每支探索队上限
+
+# 贸易救援系统：
+# 状态链 申请/审核(applied) → 运输(transporting) → 交付(delivered)/失败回退(failed)/拒绝(rejected)
+#   applied      —— 申请已发出等待审核：外部队伍向地堡申请（review_by=bunker，地堡管理者审核），
+#                    或地堡主动申请（review_by=external，当日由外部聚落审核）
+#   transporting —— 审核通过，商队在途，随每日推进行军并抽失败风险
+#   delivered    —— 终态：送达交付，结果回写资源/居民/信誉/士气
+#   failed       —— 终态：失败回退，押金按失败类型退还/没收，并可能回写为地堡危机
+#   rejected     —— 终态：审核拒绝或申请超时，无资金往来
+TRADE_STATUS_APPLIED = "applied"
+TRADE_STATUS_TRANSPORTING = "transporting"
+TRADE_STATUS_DELIVERED = "delivered"
+TRADE_STATUS_FAILED = "failed"
+TRADE_STATUS_REJECTED = "rejected"
+TRADE_STATUS_ABORTED = "aborted"  # 终局强制中止（押金全额退回）
+TRADE_TERMINAL_STATUSES = (
+    TRADE_STATUS_DELIVERED,
+    TRADE_STATUS_FAILED,
+    TRADE_STATUS_REJECTED,
+    TRADE_STATUS_ABORTED,
+)
+TRADE_ACTIVE_STATUSES = (TRADE_STATUS_APPLIED, TRADE_STATUS_TRANSPORTING)
+TRADE_MAX_ESCORTS = 2          # 每张订单最多押运人数
+TRADE_MAX_ACTIVE_ORDERS = 3    # 同时在途/待审订单上限
+TRADE_INBOUND_CHANCE = 0.4     # 每日外部队伍主动申请贸易/救援的概率
+TRADE_INBOUND_EXPIRE_DAYS = 3  # 外部申请的审核时限，超时自动判为拒绝
+TRADE_INITIAL_REPUTATION = 50  # 新档案初始信誉
+
+# 外部聚落审核（地堡主动申请）：信誉越高越容易接单
+TRADE_ACCEPT_BASE = 0.55
+TRADE_ACCEPT_REP_SLOPE = 0.006
+# 商路风险（运输每日）：基础风险 - 信誉修正，再叠加订单固有风险
+TRADE_RISK_BASE = 0.16
+TRADE_RISK_REP_SLOPE = 0.0012
 
 
 def _clamp(v, lo=0.0, hi=100.0):
@@ -140,13 +175,30 @@ class BunkerEngine:
     def active_facilities(self):
         return [f for f in self.session.facilities if f.status == "active"]
 
-    # ---- 探索队成员追踪 ----
+    # ---- 外出人员追踪 ----
     def _away_resident_ids(self):
-        """当前探索队编制内的居民编号（无论生死）；无在外队伍时为空集。"""
+        """当前离堡执行任务的居民编号（探索队 + 贸易押运）；无在外任务时为空集。
+
+        探索队与商队押运的居民统一暂停地堡生产、不消耗地堡口粮、不参与
+        地堡危机效果，两类任务的“离堡”口径一致。
+        """
+        ids = set()
         exp = self.session.expedition
-        if not exp or exp.get("status") != "away":
-            return set()
-        return set(exp.get("members", []))
+        if exp and exp.get("status") == "away":
+            ids.update(exp.get("members", []))
+        for order in self._active_orders():
+            ids.update(order.get("escorts", []))
+        return ids
+
+    def _away_kind(self, resident_id):
+        """居民当前的外出类型：'expedition' / 'escort' / None。"""
+        exp = self.session.expedition
+        if exp and exp.get("status") == "away" and resident_id in exp.get("members", []):
+            return "expedition"
+        for order in self._active_orders():
+            if order.get("status") == TRADE_STATUS_TRANSPORTING and resident_id in order.get("escorts", []):
+                return "escort"
+        return None
 
     def _away_residents(self):
         """探索队编制内的全部居民（含已阵亡，用于返程结算）。"""
@@ -179,8 +231,10 @@ class BunkerEngine:
             # 强制返程（补给耗尽/期满/全员失联）会清除探索队状态：
             # 此时不得再用旧 exp 触发遭遇，否则会把已结算的队伍恢复成"在外"
             if self.session.expedition is None:
+                # 贸易救援订单与探索队并行：即便队伍当天已收敛，商队仍正常推进
+                crisis = self._advance_trade_pipeline(pre_verdict=pre_verdict)
                 self._check_end(forced_verdict=pre_verdict)
-                return None
+                return crisis
             # 终局优先：抵达目标日胜利，或地堡因在堡匮乏/人口归零失败时，
             # 在外队伍先安全返程（战利品入库、剩余物资归还、幸存者归队），
             # 再统一收敛到 ended——绝不在 ended 档案上留下无法处理的"僵尸队伍"
@@ -188,14 +242,25 @@ class BunkerEngine:
                 self._settle_expedition(
                     self.session.expedition, reason="终局已至，探索队返程"
                 )
+                crisis = self._advance_trade_pipeline(pre_verdict=pre_verdict)
                 self._check_end(forced_verdict=pre_verdict)
-                return None
+                return crisis
+            # 贸易救援订单先行：商队遇袭会挂起地堡危机（盗匪截击），
+            # 当天探索队不再触发遭遇——地堡先处理危机，次日再行军
+            crisis = self._advance_trade_pipeline(pre_verdict=pre_verdict)
+            if crisis is not None:
+                return crisis
             # 探索队行军中：触发遭遇（替代地堡危机），遭遇挂起后进入 expedition 阶段
             return self._maybe_trigger_expedition_encounter(self.session.expedition)
         # 终局优先：抵达目标日或全面崩溃直接结算结局，不再凭空挂起一个
         # 永远无法处理的危机（统一每日推进 → 危机处理 → 终局的流转）
         if self._check_end(forced_verdict=pre_verdict):
             return None
+        # 贸易救援订单：运输在途的商队行军/抽风险（失败可能挂起地堡危机），
+        # 并可能收到外部聚落发来的新申请
+        crisis = self._advance_trade_pipeline()
+        if crisis is not None:
+            return crisis
         return self._maybe_trigger_crisis()
 
     def _end_conditions_met(self):
@@ -1026,6 +1091,518 @@ class BunkerEngine:
         return detail, False
 
 
+    # ==================================================================
+    # 贸易救援模块：申请 → 审核 → 运输 → 交付/失败回退 的完整状态链
+    # ==================================================================
+    def _orders(self):
+        """订单列表（读取便捷；写回统一走 _save_orders 保证 JSON 落库）。"""
+        return self.session.trade_orders or []
+
+    def _save_orders(self, orders):
+        # 整体回写并显式标记 JSON 列为脏：列表内的订单是普通 dict，
+        # 原地改 status/timeline/result 不会被 MutableList 自动追踪，必须 flag 一次，
+        # 保证“把列表中的订单原地改判”这种写法也能落库
+        self.session.trade_orders = list(orders)
+        flag_modified(self.session, "trade_orders")
+
+    def _get_order(self, order_id):
+        return next((o for o in self._orders() if o.get("id") == order_id), None)
+
+    def _active_orders(self):
+        """未到终态的订单（申请/审核中 + 运输在途）。"""
+        return [o for o in self._orders() if o.get("status") in TRADE_ACTIVE_STATUSES]
+
+    def _escort_resident_ids(self):
+        """当前正在商队押运（仅在途订单）的居民编号。"""
+        ids = set()
+        for o in self._orders():
+            if o.get("status") == TRADE_STATUS_TRANSPORTING:
+                ids.update(o.get("escorts", []))
+        return ids
+
+    # ---- 可申请订单（由模板池 + 当前信誉筛选） ----
+    def available_offers(self):
+        """当前信誉下可申请的贸易/救援模板列表（外部聚落提供给地堡）。"""
+        rep = self.session.reputation or 0
+        return [
+            self._public_offer(o)
+            for o in TRADE_OFFERS
+            if rep >= o.get("min_reputation", 0)
+        ]
+
+    @staticmethod
+    def _public_offer(o):
+        return {
+            "key": o["key"],
+            "title": o["title"],
+            "kind": o["kind"],          # trade 贸易 / rescue 救援
+            "desc": o.get("desc", ""),
+            "payment": dict(o.get("payment", {})),   # 地堡支付（审核通过时托管）
+            "reward": dict(o.get("reward", {})),     # 送达后入库的回报
+            "travel_days": o.get("travel_days", 2),
+            "risk": o.get("risk", 0.1),
+            "morale_bonus": o.get("morale_bonus", 0),
+            "rep_bonus": o.get("rep_bonus", 2),
+            "add_survivor": 1 if o.get("add_survivor") else 0,
+            "bonus_health": o.get("bonus_health", 0),
+            "max_escorts": TRADE_MAX_ESCORTS,
+            "min_reputation": o.get("min_reputation", 0),
+        }
+
+    # ---- 申请 ----
+    def apply_trade(self, offer_key, escort_ids=None):
+        """地堡管理者主动向外部聚落申请贸易/救援订单。
+
+        申请写入即进入 applied(审核) 阶段（review_by=external）：不立即扣款，
+        当日每日推进时由外部聚落审核——通过则托管押金并进入运输，
+        拒绝（信誉不足等）则订单判为 rejected。可选押运员（最多 2 人）。
+        """
+        self._require_daily_phase("申请贸易救援")
+        offer = next((o for o in TRADE_OFFERS if o["key"] == offer_key), None)
+        if offer is None:
+            raise BunkerEngineError("未知贸易订单")
+        rep = self.session.reputation or 0
+        if rep < offer.get("min_reputation", 0):
+            raise BunkerEngineError("信誉不足，该聚落暂不愿与你方交易")
+        if len(self._active_orders()) >= TRADE_MAX_ACTIVE_ORDERS:
+            raise BunkerEngineError(f"同时进行的订单已达上限（{TRADE_MAX_ACTIVE_ORDERS} 单）")
+        escorts = self._validate_escorts(escort_ids or [])
+        order = self._build_order(offer, origin="outbound", escorts=escorts)
+        orders = self._orders()
+        orders.append(order)
+        self._save_orders(orders)
+        names = "、".join(self._resident_name(i) for i in escorts) if escorts else "无押运"
+        self._log(
+            "trade", "贸易申请已发出",
+            f"{offer['title']}：等待「{order['party']}」审核（押运：{names}）。",
+            decision="申请贸易救援",
+        )
+        return order
+
+    def _validate_escorts(self, escort_ids):
+        """校验押运员：本档案存活、在堡、未参加探索队/其他商队、不重复、上限 2 人。"""
+        if not escort_ids:
+            return []
+        if len(escort_ids) > TRADE_MAX_ESCORTS:
+            raise BunkerEngineError(f"每张订单最多 {TRADE_MAX_ESCORTS} 名押运员")
+        if len(set(escort_ids)) != len(escort_ids):
+            raise BunkerEngineError("同一名居民不能重复担任押运员")
+        busy = self._away_resident_ids() | self._escort_resident_ids()
+        escorts = []
+        for rid in escort_ids:
+            r = next((x for x in self.session.residents if x.id == rid), None)
+            if not r or not r.alive:
+                raise BunkerEngineError("押运员不存在或已故")
+            if r.id in busy:
+                raise BunkerEngineError(f"{r.name} 正在执行探索/押运任务，无法离堡")
+            escorts.append(r.id)
+            busy.add(r.id)
+        return escorts
+
+    def _resident_name(self, rid):
+        r = next((x for x in self.session.residents if x.id == rid), None)
+        return r.name if r else f"#{rid}"
+
+    def _build_order(self, offer, origin, escorts, party=None):
+        """依据模板构造一张订单快照（applied 阶段）。
+
+        origin=inbound  外部队伍主动向地堡申请，review_by=bunker（管理者审核）
+        origin=outbound 地堡主动申请，review_by=external（外部聚落审核）
+        """
+        now = self.session.day
+        review_by = "bunker" if origin == "inbound" else "external"
+        return {
+            "id": uuid.uuid4().hex[:12],
+            "token": uuid.uuid4().hex,       # 审核/拒绝动作的一次性凭据
+            "offer_key": offer["key"],
+            "title": offer["title"],
+            "kind": offer["kind"],
+            "origin": origin,                # inbound 外部申请 / outbound 地堡申请
+            "review_by": review_by,
+            "party": party or offer.get("party", "外部聚落"),
+            "status": TRADE_STATUS_APPLIED,
+            "created_day": now,
+            "expire_day": now + TRADE_INBOUND_EXPIRE_DAYS if origin == "inbound" else None,
+            "payment": dict(offer.get("payment", {})),
+            "reward": dict(offer.get("reward", {})),
+            "travel_days": offer.get("travel_days", 2),
+            "elapsed_days": 0,
+            "risk": offer.get("risk", 0.1),
+            "morale_bonus": offer.get("morale_bonus", 0),
+            "rep_bonus": offer.get("rep_bonus", 2),
+            "add_survivor": 1 if offer.get("add_survivor") else 0,
+            "bonus_health": offer.get("bonus_health", 0),
+            "escorts": list(escorts),
+            "timeline": [{"day": now, "stage": TRADE_STATUS_APPLIED,
+                          "note": "外部队伍求援" if origin == "inbound" else "地堡发出申请"}],
+            "result": None,
+        }
+
+    # ---- 审核（地堡管理者）：批准/拒绝外部队伍的申请 ----
+    _TRADE_ACT_REVIEW = "review"
+
+    def _matches_trade(self, rec, order_id, token, decision=None):
+        if not rec or rec.get("order_id") != order_id:
+            return False
+        if token is not None and rec.get("token") and token != rec["token"]:
+            return False
+        if decision is not None and rec.get("decision") != decision:
+            return False
+        return True
+
+    def review_trade(self, order_id, approve, token=None):
+        """地堡管理者审核外部队伍的贸易/救援申请（review_by=bunker）。
+
+        批准：托管押金（扣资源）→ 进入运输；拒绝：订单判 rejected。
+        返回 (order, replayed)：replayed=True 表示重复/并发落败请求安全回放。
+        """
+        self._ensure_running()
+        rec = self.session.last_trade
+        if rec and self._matches_trade(rec, order_id, token):
+            return self._get_order(order_id) or rec.get("order_snapshot"), True
+        self._require_daily_phase("审核贸易申请")
+        order = self._get_order(order_id)
+        if order is None:
+            raise BunkerEngineError("订单不存在")
+        if order.get("status") != TRADE_STATUS_APPLIED or order.get("review_by") != "bunker":
+            raise BunkerEngineError("该订单已不在待审核状态")
+        if token is not None and order.get("token") and token != order["token"]:
+            raise BunkerEngineConflict("该贸易申请已过期，请按当前订单重新操作")
+        decision = "approve" if approve else "reject"
+        if not approve:
+            self._mark_rejected(order, reason="地堡管理者拒绝了本次交易", rep_delta=-1)
+            detail = f"已拒绝「{order['party']}」的{self._kind_zh(order['kind'])}申请"
+            self._log("trade", "拒绝贸易申请", f"{order['title']}：{detail}。", decision="拒绝")
+        else:
+            payment = order.get("payment", {})
+            if not self._can_afford(payment):
+                raise BunkerEngineError("资源不足，无法托管这笔交易的押金")
+            for k, v in payment.items():
+                self._add_resource(k, -v)
+            order["status"] = TRADE_STATUS_TRANSPORTING
+            order["timeline"].append({"day": self.session.day, "stage": TRADE_STATUS_TRANSPORTING,
+                                      "note": f"管理者批准，押金已托管，{order['party']}商队启程"})
+            self._log("trade", "贸易申请已批准",
+                      f"{order['title']}：托管{self._fmt_costs(payment)}，商队启程（预计 {order['travel_days']} 天）。",
+                      decision="批准")
+            detail = f"已批准「{order['party']}」的{self._kind_zh(order['kind'])}申请"
+        self._save_orders(self._orders())
+        self._remember_trade(self._TRADE_ACT_REVIEW, order, decision, token or order.get("token"), detail)
+        return order, False
+
+    def reconcile_stale_trade(self, order_id, token, decision):
+        """并发落败（版本冲突）后核对：同一张订单同一动作则安全回放，否则 409。"""
+        rec = self.session.last_trade
+        if self._matches_trade(rec, order_id, token, decision=decision):
+            return rec.get("order_snapshot"), True
+        raise BunkerEngineConflict("贸易订单状态已被其他请求更新，请刷新后重试")
+
+    def _remember_trade(self, action, order, decision, token, detail):
+        self.session.last_trade = {
+            "action": action,
+            "order_id": order.get("id"),
+            "offer_key": order.get("offer_key"),
+            "decision": decision,
+            "token": token,
+            "day": self.session.day,
+            "detail": detail,
+            "order_snapshot": dict(order),
+        }
+
+    def _mark_rejected(self, order, reason, rep_delta=0):
+        order["status"] = TRADE_STATUS_REJECTED
+        order["result"] = {"reason": reason}
+        order["timeline"].append({"day": self.session.day, "stage": TRADE_STATUS_REJECTED, "note": reason})
+        if rep_delta:
+            self._adjust_reputation(rep_delta)
+
+    # ---- 归档终态订单 ----
+    def dismiss_trade(self, order_id):
+        """归档一张已结束（交付/失败/拒绝）的订单，从活跃列表中移除（大事记仍有记录）。"""
+        self._ensure_running()
+        order = self._get_order(order_id)
+        if order is None:
+            raise BunkerEngineError("订单不存在")
+        if order.get("status") not in TRADE_TERMINAL_STATUSES:
+            raise BunkerEngineError("订单尚未结束，无法归档")
+        orders = [o for o in self._orders() if o.get("id") != order_id]
+        self._save_orders(orders)
+
+    # ---- 每日推进：外部审核/超时、商队行军、风险判定、新申请 ----
+    def _advance_trade_pipeline(self, pre_verdict=None):
+        """推进全部贸易救援订单一天。
+
+        顺序：①外部申请超时判拒绝 ②外部聚落审核地堡的申请 ③在途商队行军/抽风险
+        ④外部聚落可能发来新申请。返回挂起的地堡危机（商队遇袭）或 None。
+        pre_verdict 非 None（推进前已终局）时只做订单中止，不抽风险、不发新申请。
+        """
+        orders = self._orders()
+        pending_crisis = None
+        for order in orders:
+            status = order.get("status")
+            if status == TRADE_STATUS_APPLIED:
+                if order.get("review_by") == "bunker":
+                    # 外部队伍的申请逾期未处理：自动判拒绝（信誉不受损）
+                    if order.get("expire_day") is not None and self.session.day >= order["expire_day"]:
+                        self._mark_rejected(order, reason="审核超时，外部队伍已离开")
+                        self._log("trade", "贸易申请超时",
+                                  f"{order['title']}：{order['result']['reason']}。", decision="自动拒绝")
+                elif pre_verdict is None:
+                    # 地堡的申请：由外部聚落审核
+                    self._review_by_external(order)
+            elif status == TRADE_STATUS_TRANSPORTING:
+                if pre_verdict is not None:
+                    self._abort_order(order, reason="终局已至，商队中止行程")
+                else:
+                    crisis = self._travel_order(order)
+                    if crisis is not None and pending_crisis is None:
+                        pending_crisis = crisis
+        # 订单可能在循环中被改判/中止，统一整体回写
+        if orders:
+            self._save_orders(orders)
+        if pre_verdict is None and pending_crisis is None and self.session.survivors > 0:
+            self._maybe_inbound_offer()
+        return pending_crisis
+
+    def _review_by_external(self, order):
+        """外部聚落审核地堡的申请：信誉决定接单概率；通过则托管押金并发车。"""
+        accept_chance = _clamp(
+            TRADE_ACCEPT_BASE + TRADE_ACCEPT_REP_SLOPE * (self.session.reputation or 0), 0.05, 0.97
+        )
+        if self.rand.random() > accept_chance:
+            self._mark_rejected(
+                order, reason=f"「{order['party']}」对此次交易缺乏信任，拒绝了申请", rep_delta=0
+            )
+            self._log("trade", "外部聚落拒绝交易",
+                      f"{order['title']}：{order['result']['reason']}。", decision="外部拒绝")
+            return
+        payment = order.get("payment", {})
+        if not self._can_afford(payment):
+            # 审核期间物资被挪作他用：无法托管，订单搁置回 applied，等待管理者补资源
+            order["result"] = {"reason": "押金不足，等待物资补齐后再次审核"}
+            self._log("trade", "贸易押金不足",
+                      f"{order['title']}：托管{self._fmt_costs(payment)}的物资不足，订单暂缓。",
+                      decision="审核暂缓")
+            return
+        for k, v in payment.items():
+            self._add_resource(k, -v)
+        order["status"] = TRADE_STATUS_TRANSPORTING
+        order["timeline"].append(
+            {"day": self.session.day, "stage": TRADE_STATUS_TRANSPORTING,
+             "note": f"「{order['party']}」接受申请，押金已托管，商队启程"}
+        )
+        self._log("trade", "贸易申请获批准",
+                  f"{order['title']}：托管{self._fmt_costs(payment)}，商队启程（预计 {order['travel_days']} 天）。",
+                  decision="外部批准")
+
+    def _travel_order(self, order):
+        """在途商队行军一天：抽失败风险，抵达则交付结算。返回挂起的危机或 None。"""
+        order["elapsed_days"] = order.get("elapsed_days", 0) + 1
+        risk = _clamp(order.get("risk", 0.1) - TRADE_RISK_REP_SLOPE * (self.session.reputation or 0), 0.02, 0.6)
+        if self.rand.random() < risk:
+            # 失败类型：多数为盗匪截击（回退一半押金并挂地堡危机），少数为恶劣天气（全退，不挂危机）
+            bandit = self.rand.random() < 0.7
+            if bandit:
+                return self._fail_order(order, "bandit")
+            return self._fail_order(order, "storm")
+        if order["elapsed_days"] >= order.get("travel_days", 1):
+            self._deliver_order(order)
+        else:
+            order["timeline"].append(
+                {"day": self.session.day, "stage": TRADE_STATUS_TRANSPORTING,
+                 "note": f"商队在途（第 {order['elapsed_days']}/{order['travel_days']} 天），一路平安"}
+            )
+        return None
+
+    # ---- 交付：结果回写资源 / 居民 / 信誉 / 士气 ----
+    def _deliver_order(self, order):
+        reward = order.get("reward", {})
+        parts = [f"{RESOURCE_ZH.get(k, k)} +{v:g}" for k, v in reward.items() if v > 0]
+        for k, v in reward.items():
+            if v > 0:
+                self._add_resource(k, v)
+        # 救援订单：被救幸存者加入地堡（flush 取得 id，与探索队偶遇幸存者口径一致）
+        added_name = None
+        if order.get("add_survivor"):
+            added_name = self._random_survivor_name()
+            self.db.add(Resident(
+                session_id=self.session.id, name=added_name, job="general",
+                health=65.0, morale=60.0, alive=1, joined_day=self.session.day,
+            ))
+            self.db.flush()
+            self.session.survivors += 1
+            parts.append(f"幸存者 {added_name} 获救加入")
+        # 全体存活居民士气（在堡 + 押运归队都受益）
+        morale_bonus = order.get("morale_bonus", 0)
+        health_bonus = order.get("bonus_health", 0)
+        if morale_bonus or health_bonus:
+            for r in self.session.residents:
+                if not r.alive:
+                    continue
+                if morale_bonus:
+                    r.morale = _clamp(r.morale + morale_bonus)
+                if health_bonus:
+                    r.health = _clamp(r.health + health_bonus)
+            if morale_bonus:
+                parts.append(f"全体士气 {morale_bonus:+.0f}")
+            if health_bonus:
+                parts.append(f"全体健康 {health_bonus:+.0f}")
+        rep_bonus = order.get("rep_bonus", 2)
+        self._adjust_reputation(rep_bonus)
+        parts.append(f"信誉 {rep_bonus:+d}")
+        detail = "，".join(parts) if parts else "交易完成"
+        order["status"] = TRADE_STATUS_DELIVERED
+        order["result"] = {
+            "detail": detail,
+            "reward": dict(reward),
+            "rep_delta": rep_bonus,
+            "morale_bonus": morale_bonus,
+            "added_resident": added_name,
+        }
+        order["timeline"].append({"day": self.session.day, "stage": TRADE_STATUS_DELIVERED, "note": detail})
+        kind_zh = self._kind_zh(order["kind"])
+        self._log(
+            "trade", f"{kind_zh}订单交付",
+            f"{order['title']}（{order['party']}）：{detail}。",
+            decision="交付成功",
+        )
+
+    # ---- 失败回退：押金退还/没收、士气、押运员受伤、危机回写 ----
+    def _fail_order(self, order, reason_key):
+        payment = order.get("payment", {})
+        escorts = [next((r for r in self.session.residents if r.id == i), None)
+                   for i in order.get("escorts", [])]
+        escorts = [r for r in escorts if r and r.alive]
+        if reason_key == "bandit":
+            refund_rate, rep_delta, morale_delta, escort_hp = 0.5, -8, -8, -15
+            reason = "盗匪截击商队"
+        else:
+            refund_rate, rep_delta, morale_delta, escort_hp = 1.0, -3, -5, -5
+            reason = "辐射风暴吞没商路"
+        # 押金按比例退还（盗匪截走一半；风暴全退但白跑一趟）
+        refund = {}
+        refund_parts = []
+        for k, v in payment.items():
+            back = round(v * refund_rate, 1)
+            refund[k] = back
+            if back > 0:
+                self._add_resource(k, back)
+                refund_parts.append(f"{RESOURCE_ZH.get(k, k)} +{back:g}")
+        # 全体存活居民士气受挫
+        if morale_delta:
+            for r in self.session.residents:
+                if r.alive:
+                    r.morale = _clamp(r.morale + morale_delta)
+        # 押运员受伤（健康归零即殉职，人口扣减）
+        hurt_names, dead_names = [], []
+        for r in escorts:
+            r.health = _clamp(r.health + escort_hp)
+            if r.health <= 0 and r.alive:
+                r.alive = 0
+                r.health = 0
+                self.session.survivors = max(0, self.session.survivors - 1)
+                dead_names.append(r.name)
+            else:
+                hurt_names.append(r.name)
+        self._adjust_reputation(rep_delta)
+        parts = [f"押金退还：{'、'.join(refund_parts)}" if refund_parts else "押金全部损失",
+                 f"信誉 {rep_delta:+d}", f"全体士气 {morale_delta:+.0f}"]
+        if dead_names:
+            parts.append(f"押运殉职：{'、'.join(dead_names)}")
+        if hurt_names:
+            parts.append(f"押运受伤：{'、'.join(hurt_names)}")
+        detail = "，".join(parts)
+        order["status"] = TRADE_STATUS_FAILED
+        order["result"] = {
+            "fail_reason": reason_key,
+            "reason": reason,
+            "detail": detail,
+            "refund": refund,
+            "rep_delta": rep_delta,
+            "morale_delta": morale_delta,
+            "casualties": dead_names,
+        }
+        order["timeline"].append({"day": self.session.day, "stage": TRADE_STATUS_FAILED, "note": f"{reason}：{detail}"})
+        self._log("trade", f"{self._kind_zh(order['kind'])}失败：{reason}",
+                  f"{order['title']}（{order['party']}）：{detail}。", decision="失败回退")
+        # 回写危机流程：盗匪截击挂起一个地堡危机（玩家抉择），风暴仅结算不挂危机
+        if reason_key == "bandit":
+            return self._build_trade_raid_crisis(order)
+        return None
+
+    def _build_trade_raid_crisis(self, order):
+        """商队遇袭回写为待处理地堡危机（复用危机状态机与幂等回放链路）。"""
+        event = next(e for e in CRISIS_POOL if e["key"] == "trade_raid")
+        crisis = self._build_crisis(event)
+        crisis["source"] = "trade"
+        crisis["order_id"] = order["id"]
+        crisis["order_title"] = order["title"]
+        crisis["desc"] = (
+            f"「{order['party']}」前往交付 {order['title']} 的商队在归路上遭盗匪截击，"
+            "匪徒尾随至地堡气闸外，正试图破门抢夺仓储。"
+        )
+        self.session.pending_crisis = crisis
+        return crisis
+
+    # ---- 终局/中止 ----
+    def _abort_active_orders(self, reason):
+        orders = self._orders()
+        changed = False
+        for order in orders:
+            if order.get("status") in TRADE_ACTIVE_STATUSES:
+                self._abort_order(order, reason=reason)
+                changed = True
+        if changed:
+            self._save_orders(orders)
+
+    def _abort_order(self, order, reason):
+        """中止在途/待审订单：已托管押金全额退回，不动信誉/士气，押运员直接归队。"""
+        refunded = []
+        for k, v in order.get("payment", {}).items():
+            # 仅 transporting 阶段押金已托管；applied 阶段尚未扣款
+            if order.get("status") == TRADE_STATUS_TRANSPORTING and v > 0:
+                self._add_resource(k, v)
+                refunded.append(f"{RESOURCE_ZH.get(k, k)} +{v:g}")
+        order["status"] = TRADE_STATUS_ABORTED
+        order["result"] = {"reason": reason, "refund_detail": "、".join(refunded)}
+        order["timeline"].append({"day": self.session.day, "stage": TRADE_STATUS_ABORTED, "note": reason})
+
+    # ---- 外部队伍主动申请（inbound） ----
+    def _maybe_inbound_offer(self):
+        """每日概率收到外部聚落的贸易/救援申请，进入待管理者审核状态。"""
+        if self.rand.random() > TRADE_INBOUND_CHANCE:
+            return
+        if self.session.pending_crisis:
+            return
+        if len(self._active_orders()) >= TRADE_MAX_ACTIVE_ORDERS:
+            return
+        template = self.rand.choice(TRADE_INBOUND_POOL)
+        party = self.rand.choice(TRADE_PARTIES)
+        offer = dict(template, party=party)
+        order = self._build_order(offer, origin="inbound", escorts=[])
+        orders = self._orders()
+        orders.append(order)
+        self._save_orders(orders)
+        self._log(
+            "trade", "外部队伍求援",
+            f"「{party}」发来{self._kind_zh(order['kind'])}申请：{order['title']}，"
+            f"请在 {TRADE_INBOUND_EXPIRE_DAYS} 天内审核。",
+            decision="收到申请",
+        )
+
+    def _adjust_reputation(self, delta):
+        self.session.reputation = int(_clamp((self.session.reputation or TRADE_INITIAL_REPUTATION) + delta, 0, 100))
+
+    @staticmethod
+    def _kind_zh(kind):
+        return "救援" if kind == "rescue" else "贸易"
+
+    @staticmethod
+    def _fmt_costs(costs):
+        parts = [f"{RESOURCE_ZH.get(k, k)} {v:g}" for k, v in (costs or {}).items() if v]
+        return "、".join(parts) if parts else "无押金"
+
+
     # ---- 扩建 ----
     def build_facility(self, category):
         self._require_daily_phase("建造设施")
@@ -1101,6 +1678,9 @@ class BunkerEngine:
         # 不重算分数、不重复写结局日志
         if self.session.status != "running":
             return
+        # 终局收敛前中止一切在途贸易救援订单：押金全额退回、押运员归队，
+        # 不把悬而未决的订单/离堡押运员带进 ended
+        self._abort_active_orders(reason="终局已至，商队中止行程")
         self.session.status = "win" if win else "over"
         # 进入终局后不存在悬而未决的抉择/在外队伍，状态机统一收敛到 ended
         self.session.pending_crisis = None
@@ -1250,6 +1830,25 @@ CRISIS_POOL = [
                 "label": "集中避寒",
                 "hint": "士气下降，但省下燃料",
                 "effects": {"morale": -10},
+            },
+        ],
+    },
+    {
+        "key": "trade_raid",
+        "title": "商路盗匪截击",
+        "desc": "外部商队归路上遭盗匪截击，匪徒尾随至地堡气闸外，试图破门抢夺仓储。",
+        "choices": [
+            {
+                "key": "ambush",
+                "label": "设伏反打",
+                "hint": "消耗电力设伏，一名队员可能受伤，击退盗匪并缴获物资",
+                "effects": {"resources": {"power": -6, "food": 10, "water": 6}, "health": {"value": -10, "target": "single"}},
+            },
+            {
+                "key": "buy_off",
+                "label": "破财消灾",
+                "hint": "交出部分食物与电力换盗匪退去，无人受伤",
+                "effects": {"resources": {"food": -12, "power": -8}},
             },
         ],
     },
@@ -1421,5 +2020,149 @@ EXPEDITION_ENCOUNTERS = [
                 "effects": {"health": {"value": -18, "target": "single"}, "supply_loss": {FOOD: 2}},
             },
         ],
+    },
+]
+
+
+# ============ 贸易救援模板池 ============
+# 地堡管理者可主动申请（outbound）：payment 审核通过后托管，reward 送达后入库。
+# 字段：
+#   kind          trade 贸易 / rescue 救援
+#   payment       地堡支付的押金（外部商队启程时扣除，失败按类型退还）
+#   reward        送达交付后入库的回报
+#   travel_days   运输天数；risk 订单固有风险（再随信誉下调）
+#   morale_bonus  交付成功时全体存活居民士气变化；bonus_health 同理作用于健康
+#   rep_bonus     交付成功的信誉奖励；min_reputation 申请所需信誉门槛
+#   add_survivor  救援订单：交付时是否有获救幸存者加入地堡
+TRADE_PARTIES = ["锈河聚落", "铁壁哨站", "灰岩营地", "北岭车队"]
+
+
+TRADE_OFFERS = [
+    {
+        "key": "grain_deal",
+        "title": "以水换粮",
+        "kind": "trade",
+        "party": "锈河聚落",
+        "desc": "锈河聚落水源告急，愿意用囤积的罐头换取地堡净化水。",
+        "payment": {WATER: 25},
+        "reward": {FOOD: 40},
+        "travel_days": 2, "risk": 0.12,
+        "morale_bonus": 4, "rep_bonus": 3, "min_reputation": 0,
+    },
+    {
+        "key": "cell_battery",
+        "title": "燃料电池包",
+        "kind": "trade",
+        "party": "铁壁哨站",
+        "desc": "铁壁哨站拆解军用设备得到燃料电池，只收食物作为硬通货。",
+        "payment": {FOOD: 30},
+        "reward": {POWER: 45},
+        "travel_days": 3, "risk": 0.16,
+        "morale_bonus": 3, "rep_bonus": 3, "min_reputation": 0,
+    },
+    {
+        "key": "oxygen_capsule",
+        "title": "压缩氧气舱",
+        "kind": "trade",
+        "party": "灰岩营地",
+        "desc": "灰岩营地封存着工业级压缩氧气舱，需要电力与水源一并交换。",
+        "payment": {POWER: 20, WATER: 20},
+        "reward": {OXY: 45},
+        "travel_days": 3, "risk": 0.18,
+        "morale_bonus": 4, "rep_bonus": 4, "min_reputation": 30,
+    },
+    {
+        "key": "medic_escort",
+        "title": "护送医疗队",
+        "kind": "rescue",
+        "party": "北岭车队",
+        "desc": "北岭车队的医疗队被困中转站，出资请求地堡派人护送他们安全抵达。",
+        "payment": {FOOD: 15},
+        "reward": {POWER: 15, WATER: 15},
+        "travel_days": 2, "risk": 0.2,
+        "morale_bonus": 8, "rep_bonus": 6, "min_reputation": 20,
+        "bonus_health": 6,
+    },
+    {
+        "key": "rescue_family",
+        "title": "营救幸存者一家",
+        "kind": "rescue",
+        "party": "锈河聚落",
+        "desc": "锈河聚落附近的避难站失联，一名幸存者带着孩子等待接应，获救者愿加入地堡。",
+        "payment": {FOOD: 12, WATER: 12},
+        "reward": {FOOD: 8},
+        "travel_days": 3, "risk": 0.22,
+        "morale_bonus": 10, "rep_bonus": 8, "min_reputation": 35,
+        "add_survivor": True,
+    },
+    {
+        "key": "ammo_scrap",
+        "title": "军械废料",
+        "kind": "trade",
+        "party": "铁壁哨站",
+        "desc": "一批战前军械废料可拆成发电部件，但路途盗匪猖獗，只与信誉过硬的地堡交易。",
+        "payment": {FOOD: 35, WATER: 15},
+        "reward": {POWER: 35, OXY: 15},
+        "travel_days": 4, "risk": 0.24,
+        "morale_bonus": 5, "rep_bonus": 5, "min_reputation": 50,
+    },
+    {
+        "key": "greenhouse_seeds",
+        "title": "穹顶菜种",
+        "kind": "trade",
+        "party": "灰岩营地",
+        "desc": "灰岩营地保存着一批耐寒菜种，能显著充实地堡粮仓，交易条件不菲。",
+        "payment": {POWER: 30, WATER: 20},
+        "reward": {FOOD: 55},
+        "travel_days": 3, "risk": 0.14,
+        "morale_bonus": 6, "rep_bonus": 4, "min_reputation": 40,
+    },
+]
+
+
+# 外部队伍主动发来的申请（inbound）：地堡支付押金救援/收购，送达获得回报。
+# 结构与 TRADE_OFFERS 相同，party 由每日随机选取。
+TRADE_INBOUND_POOL = [
+    {
+        "key": "in_refugees",
+        "title": "难民求庇",
+        "kind": "rescue",
+        "desc": "一小队难民在地表发讯，愿用最后的物资换取地堡庇护，其中一人可加入地堡。",
+        "payment": {FOOD: 10},
+        "reward": {WATER: 18, POWER: 8},
+        "travel_days": 2, "risk": 0.15,
+        "morale_bonus": 7, "rep_bonus": 5,
+        "add_survivor": True,
+    },
+    {
+        "key": "in_water_short",
+        "title": "邻堡购水",
+        "kind": "trade",
+        "desc": "附近聚落净水器损毁，愿以罐头高价求购地堡的净化水。",
+        "payment": {WATER: 20},
+        "reward": {FOOD: 34},
+        "travel_days": 2, "risk": 0.12,
+        "morale_bonus": 3, "rep_bonus": 3,
+    },
+    {
+        "key": "in_stranded_medic",
+        "title": "接应流浪医生",
+        "kind": "rescue",
+        "desc": "一名流浪医生被困废弃诊所，承诺得救后为地堡义诊并分享药品。",
+        "payment": {FOOD: 8, WATER: 8},
+        "reward": {POWER: 10, OXY: 10},
+        "travel_days": 2, "risk": 0.18,
+        "morale_bonus": 8, "rep_bonus": 6,
+        "bonus_health": 8,
+    },
+    {
+        "key": "in_generator_parts",
+        "title": "发电机零件求售",
+        "kind": "trade",
+        "desc": "一支车队带来稀缺的发电机零件，只要地堡愿意先垫付水粮作为运输押金。",
+        "payment": {FOOD: 18, WATER: 12},
+        "reward": {POWER: 40},
+        "travel_days": 3, "risk": 0.17,
+        "morale_bonus": 4, "rep_bonus": 4,
     },
 ]

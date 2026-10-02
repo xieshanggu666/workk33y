@@ -49,6 +49,104 @@ def test_backfills_last_expedition_column(db):
     assert row.pending_crisis is None
 
 
+def test_backfills_trade_columns(db):
+    """缺列旧表经 ensure_schema 后补齐信誉/订单/幂等列，旧行信誉 50、订单空。"""
+    gs = make_session(db)
+    db.commit()
+    db.expire_all()
+    db.execute(text("ALTER TABLE game_sessions RENAME TO gs_old"))
+    db.execute(text(
+        "CREATE TABLE game_sessions ("
+        "id INTEGER PRIMARY KEY, name VARCHAR(64), day INTEGER, target_day INTEGER, "
+        "status VARCHAR(16), resources JSON, survivors INTEGER, outcome JSON, "
+        "score INTEGER, created_at DATETIME, updated_at DATETIME)"
+    ))
+    db.execute(text(
+        "INSERT INTO game_sessions SELECT id,name,day,target_day,status,resources,"
+        "survivors,outcome,score,created_at,updated_at FROM gs_old"
+    ))
+    db.execute(text("DROP TABLE gs_old"))
+    db.commit()
+
+    ensure_schema(engine)
+    db.expire_all()
+    row = db.query(GameSession).first()
+    assert row.reputation == 50
+    assert row.trade_orders == []
+    assert row.last_trade is None
+    # 补齐列后贸易模块可正常使用
+    eng = BunkerEngine(db, row, rand=FixedRand())
+    assert len(eng.available_offers()) >= 1
+
+
+def test_ended_save_active_trade_orders_cleared(db):
+    """已结束档案残留未到终态的贸易订单：归一化清除，终态订单保留。"""
+    gs = make_session(db)
+    gs.status = "over"
+    db.commit()
+    sid = gs.id
+    orders = [
+        {"id": "a1", "token": "t", "offer_key": "grain_deal", "title": "在途单",
+         "kind": "trade", "status": "transporting", "escorts": [], "timeline": []},
+        {"id": "a2", "token": "t", "offer_key": "grain_deal", "title": "已交付",
+         "kind": "trade", "status": "delivered", "escorts": [], "timeline": []},
+    ]
+    db.execute(
+        text("UPDATE game_sessions SET trade_orders = :o WHERE id = :sid"),
+        {"o": json.dumps(orders), "sid": sid},
+    )
+    db.commit()
+
+    reconcile_old_saves(engine)
+    db.expire_all()
+    fixed = db.get(GameSession, sid).trade_orders
+    assert [o["id"] for o in fixed] == ["a2"]
+
+
+def test_running_save_trade_order_with_dangling_escort_pruned(db):
+    """运行中订单的押运员编号悬空：剔除悬空编号，订单保留。"""
+    gs = make_session(db)
+    valid = gs.residents[0].id
+    db.commit()
+    sid = gs.id
+    orders = [
+        {"id": "b1", "token": "t", "offer_key": "grain_deal", "title": "在途单",
+         "kind": "trade", "status": "transporting",
+         "escorts": [valid, 999999], "timeline": []},
+    ]
+    db.execute(
+        text("UPDATE game_sessions SET trade_orders = :o WHERE id = :sid"),
+        {"o": json.dumps(orders), "sid": sid},
+    )
+    db.commit()
+
+    reconcile_old_saves(engine)
+    db.expire_all()
+    fixed = db.get(GameSession, sid).trade_orders
+    assert fixed[0]["escorts"] == [valid]
+
+
+def test_corrupt_trade_orders_json_cleared(db):
+    """订单链整体损坏（非列表）：清空，不阻塞每日推进。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    db.execute(
+        text("UPDATE game_sessions SET trade_orders = :o WHERE id = :sid"),
+        {"o": json.dumps({"not": "a list"}), "sid": sid},
+    )
+    db.commit()
+
+    n = reconcile_old_saves(engine)
+    assert n == 1
+    db.expire_all()
+    fixed = db.get(GameSession, sid)
+    assert fixed.trade_orders == []
+    eng = BunkerEngine(db, fixed, rand=FixedRand())
+    eng.advance_day()
+    db.commit()
+
+
 def test_running_save_with_corrupt_crisis_is_unblocked(db):
     """运行中档案挂着结构损坏/目标失踪的危机：归一化后清空，回到可推进的每日阶段。"""
     gs = make_session(db)

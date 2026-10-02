@@ -9,6 +9,7 @@ from app.models import GameSession
 from app.services.engine import (
     BunkerEngine,
     FOOD, WATER, POWER, OXY,
+    TRADE_INBOUND_POOL,
 )
 from tests.test_engine import make_session, ScriptedRand, FixedRand, TriggerRand  # noqa: F401
 
@@ -23,7 +24,7 @@ def client():
 
 
 def _seed(fn):
-    """在独立 DB 会话里布置初始状态并提交，返回会话 id。"""
+    """在独立 DB 会话里布置初始状态并提交，返回 (会话 id, *setup 返回值)。"""
     db = SessionLocal()
     try:
         gs = make_session(db)
@@ -31,7 +32,11 @@ def _seed(fn):
         ret = fn(db, gs, eng)
         db.commit()
         sid = gs.id
-        return (sid,) + ((ret,) if ret is not None else ())
+        if ret is None:
+            return (sid,)
+        if isinstance(ret, tuple):
+            return (sid,) + ret
+        return (sid, ret)
     finally:
         db.close()
 
@@ -292,3 +297,201 @@ def test_fatal_encounter_wrong_choice_after_convergence_409(client):
         "choice_key": "take_shelter", "token": team["token"],
     })
     assert r.status_code == 409
+
+
+# ---- 贸易救援模块 HTTP 端到端 ----
+
+def test_session_detail_carries_reputation_and_orders(client):
+    """新建档案：信誉初始 50、订单链为空。"""
+    r = client.post("/api/sessions", json={"name": "trade"})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["reputation"] == 50
+    assert body["trade_orders"] == []
+
+
+def test_trade_offers_filtered_and_apply(client):
+    """GET 可申请订单 → POST 申请生成 applied 订单。"""
+    r = client.post("/api/sessions", json={"name": "trade"})
+    sid = r.json()["id"]
+    r = client.get(f"/api/sessions/{sid}/trade/offers")
+    assert r.status_code == 200
+    offers = r.json()
+    assert any(o["key"] == "grain_deal" for o in offers)
+    # 新档案信誉 50 看不到 50 门槛的军械废料（min_reputation=50 实际可见，50>=50）
+    keys = {o["key"] for o in offers}
+    assert "grain_deal" in keys
+
+    mid = r  # noop
+    residents = client.get(f"/api/sessions/{sid}").json()["residents"]
+    r = client.post(f"/api/sessions/{sid}/trade/apply", json={
+        "offer_key": "grain_deal", "escort_ids": [residents[0]["id"]],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["order"]["status"] == "applied"
+    assert body["session"]["trade_orders"][0]["id"] == body["order"]["id"]
+
+
+def test_trade_apply_unknown_offer_400(client):
+    r = client.post("/api/sessions", json={"name": "t"})
+    sid = r.json()["id"]
+    r = client.post(f"/api/sessions/{sid}/trade/apply", json={"offer_key": "nope"})
+    assert r.status_code == 400
+
+
+def test_inbound_review_approve_and_replay(client):
+    """外部申请 → API 批准托管押金 → 同负载重试幂等回放，押金只扣一次。"""
+
+    def setup(db, gs, eng):
+        order = eng._build_order(
+            dict(next(o for o in TRADE_INBOUND_POOL if o["key"] == "in_water_short"),
+                 party="锈河聚落"),
+            origin="inbound", escorts=[],
+        )
+        gs.trade_orders = [order]
+        return order["id"], order["token"]
+
+    sid, order_id, token = _seed(setup)
+    water_before = client.get(f"/api/sessions/{sid}").json()["resources"]["water"]
+    r = client.post(f"/api/sessions/{sid}/trade/{order_id}/review", json={
+        "approve": True, "token": token,
+    })
+    assert r.status_code == 200
+    assert r.json()["order"]["status"] == "transporting"
+    water_after = r.json()["session"]["resources"]["water"]
+    assert water_after < water_before  # 押金已托管
+    # 连点/并发落败：同负载重试 200 幂等回放，押金不二次扣减
+    r2 = client.post(f"/api/sessions/{sid}/trade/{order_id}/review", json={
+        "approve": True, "token": token,
+    })
+    assert r2.status_code == 200
+    assert r2.json()["replayed"] is True
+    assert r2.json()["session"]["resources"]["water"] == water_after
+
+
+def test_inbound_review_reject(client):
+    from app.services.engine import TRADE_INBOUND_POOL
+
+    def setup(db, gs, eng):
+        tpl = dict(next(o for o in TRADE_INBOUND_POOL if o["key"] == "in_water_short"), party="x")
+        order = eng._build_order(tpl, origin="inbound", escorts=[])
+        gs.trade_orders = [order]
+        return order["id"], order["token"]
+
+    sid, order_id, token = _seed(setup)
+    r = client.post(f"/api/sessions/{sid}/trade/{order_id}/review", json={
+        "approve": False, "token": token,
+    })
+    assert r.status_code == 200
+    assert r.json()["order"]["status"] == "rejected"
+    state = client.get(f"/api/sessions/{sid}").json()
+    assert state["trade_orders"][0]["status"] == "rejected"
+    # 拒绝外部求援信誉 -1（50 → 49）
+    assert state["reputation"] == 49
+
+
+def test_trade_review_stale_token_409(client):
+    from app.services.engine import TRADE_INBOUND_POOL
+
+    def setup(db, gs, eng):
+        tpl = dict(next(o for o in TRADE_INBOUND_POOL if o["key"] == "in_water_short"), party="x")
+        order = eng._build_order(tpl, origin="inbound", escorts=[])
+        gs.trade_orders = [order]
+        return order["id"]
+
+    sid, order_id = _seed(setup)
+    r = client.post(f"/api/sessions/{sid}/trade/{order_id}/review", json={
+        "approve": True, "token": "stale",
+    })
+    assert r.status_code == 409
+    assert client.get(f"/api/sessions/{sid}").json()["trade_orders"][0]["status"] == "applied"
+
+
+def test_dismiss_terminal_order(client):
+    from app.services.engine import TRADE_INBOUND_POOL
+
+    def setup(db, gs, eng):
+        tpl = dict(next(o for o in TRADE_INBOUND_POOL if o["key"] == "in_water_short"), party="x")
+        order = eng._build_order(tpl, origin="inbound", escorts=[])
+        gs.trade_orders = [order]
+        eng.review_trade(order["id"], False, token=order["token"])
+        return order["id"]
+
+    sid, order_id = _seed(setup)
+    r = client.delete(f"/api/sessions/{sid}/trade/{order_id}")
+    assert r.status_code == 200
+    assert r.json()["trade_orders"] == []
+
+
+def test_escort_serialized_with_away_kind(client):
+    """在途押运员序列化 away=1 / away_kind=escort。"""
+    from app.services.engine import TRADE_INBOUND_POOL
+
+    def setup(db, gs, eng):
+        tpl = dict(next(o for o in TRADE_INBOUND_POOL if o["key"] == "in_water_short"), party="x")
+        order = eng._build_order(tpl, origin="inbound", escorts=[gs.residents[0].id])
+        order["status"] = "transporting"
+        gs.trade_orders = [order]
+
+    (sid,) = _seed(setup)
+    body = client.get(f"/api/sessions/{sid}").json()
+    flags = {x["id"]: (x["away"], x["away_kind"]) for x in body["residents"]}
+    rid = body["residents"][0]["id"]
+    assert flags[rid] == (1, "escort")
+    assert all(v == (0, None) for k, v in flags.items() if k != rid)
+
+
+def test_bandit_failure_crisis_resolves_via_api(client, monkeypatch):
+    """在途商队遇袭：推进挂起 trade_raid 危机 → API 结算后危机清除、订单 failed。"""
+    from app.services import engine as engine_mod
+    from app.services.engine import (
+        TRADE_INBOUND_POOL, TRADE_STATUS_TRANSPORTING,
+    )
+
+    # 风险判定必失败(0<risk) + 盗匪类型(0<0.7)；危机/申请判定恒不触发(0.99)
+    class BanditRand:
+        def __init__(self):
+            self.n = 0
+        def random(self):
+            self.n += 1
+            return 0.0 if self.n <= 2 else 0.99
+        def choice(self, seq):
+            return seq[0]
+
+    monkeypatch.setattr(engine_mod, "_rng", BanditRand)
+
+    def setup(db, gs, eng):
+        tpl = dict(next(o for o in TRADE_INBOUND_POOL if o["key"] == "in_water_short"), party="x")
+        order = eng._build_order(tpl, origin="inbound", escorts=[gs.residents[0].id])
+        order["status"] = TRADE_STATUS_TRANSPORTING
+        order["travel_days"] = 1
+        gs.trade_orders = [order]
+
+    (sid,) = _seed(setup)
+    r = client.post(f"/api/sessions/{sid}/advance")
+    assert r.status_code == 200
+    body = r.json()
+    crisis = body["session"]["pending_crisis"]
+    assert crisis is not None and crisis["event"] == "trade_raid"
+    order = body["session"]["trade_orders"][0]
+    assert order["status"] == "failed"
+    assert order["result"]["fail_reason"] == "bandit"
+    # API 结算回写的危机
+    r2 = client.post(f"/api/sessions/{sid}/resolve", json={
+        "event_key": "trade_raid", "choice_key": "buy_off",
+        "target_id": None, "token": crisis["token"],
+    })
+    assert r2.status_code == 200
+    assert r2.json()["pending_crisis"] is None
+
+
+def test_trade_apply_locked_during_crisis(client):
+    """危机待处理阶段申请贸易 → 400（后端阶段守卫）。"""
+
+    def setup(db, gs, eng):
+        gs.pending_crisis = {"token": "t", "event": "mutiny", "choices": []}
+
+    (sid,) = _seed(setup)
+    r = client.post(f"/api/sessions/{sid}/trade/apply", json={"offer_key": "grain_deal"})
+    assert r.status_code == 400

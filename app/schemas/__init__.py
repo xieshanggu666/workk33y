@@ -29,6 +29,8 @@ class ResidentOut(BaseModel):
     morale: float
     alive: int
     away: int = 0
+    # 外出任务类型：expedition 探索队 / escort 商队押运 / None
+    away_kind: Optional[str] = None
     joined_day: int
 
     class Config:
@@ -73,6 +75,10 @@ class SessionDetail(BaseModel):
     pending_crisis: Optional[Dict[str, Any]] = None
     # 探索队状态快照：在外行军/遭遇/返程，刷新后恢复同一支队伍
     expedition: Optional[Dict[str, Any]] = None
+    # 对外信誉（0-100）：影响外部接单概率、商路风险与可申请订单
+    reputation: int = 50
+    # 贸易救援订单链：申请/审核/运输/交付/失败回退
+    trade_orders: List[Dict[str, Any]] = []
     residents: List[ResidentOut] = []
     facilities: List[FacilityOut] = []
     logs: List[LogOut] = []
@@ -113,6 +119,27 @@ class ExpeditionReturn(BaseModel):
     token: Optional[str] = None
 
 
+# ---- 贸易救援 ----
+class TradeApply(BaseModel):
+    """地堡主动向外部聚落申请贸易/救援订单。"""
+    offer_key: str
+    escort_ids: List[int] = []
+
+
+class TradeReview(BaseModel):
+    """审核外部队伍发来的贸易/救援申请。"""
+    approve: bool
+    token: Optional[str] = None
+
+
+class TradeResult(BaseModel):
+    """贸易动作返回：最新档案 + 本次操作的订单快照（便于前端定位/提示）。"""
+    session: "SessionDetail"
+    order: Optional[Dict[str, Any]] = None
+    replayed: bool = False
+    detail: Optional[str] = None
+
+
 class JobAssign(BaseModel):
     job: str
 
@@ -128,6 +155,24 @@ class BuildableInfo(BaseModel):
     level_scale: float
 
 
+class TradeOfferOut(BaseModel):
+    """可申请的贸易/救援模板（由信誉门槛筛选后下发）。"""
+    key: str
+    title: str
+    kind: str
+    desc: str = ""
+    payment: Dict[str, float] = {}
+    reward: Dict[str, float] = {}
+    travel_days: int = 2
+    risk: float = 0.1
+    morale_bonus: int = 0
+    rep_bonus: int = 2
+    add_survivor: int = 0
+    bonus_health: int = 0
+    max_escorts: int = 2
+    min_reputation: int = 0
+
+
 class EngineConfig(BaseModel):
     resources: Dict[str, float]
     facility_costs: Dict[int, Dict[str, float]]
@@ -138,3 +183,7 @@ class EngineConfig(BaseModel):
 
 class Message(BaseModel):
     detail: str = "ok"
+
+
+# TradeResult.session 前向引用 SessionDetail，需在模块加载后完成绑定
+TradeResult.model_rebuild()

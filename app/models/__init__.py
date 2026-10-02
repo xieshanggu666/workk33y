@@ -11,7 +11,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy.ext.mutable import MutableDict, MutableList
 
 from ..core.database import Base
 
@@ -43,6 +43,16 @@ class GameSession(Base):
     # 落库后刷新可恢复同一支队伍；为 None 表示当前没有在外的探索队。
     # MutableDict.as_mutable：原地修改 JSON 字段（如 exp["travel_days"]=1）也会被追踪落库
     expedition = Column(MutableDict.as_mutable(JSON), nullable=True)
+    # 对外信誉（0-100）：决定外部聚落接单概率、商路风险与可申请订单档位，
+    # 交付成功/救援成功提升，遇袭/背约下降
+    reputation = Column(Integer, nullable=False, default=50)
+    # 贸易救援订单链：每张订单经历 applied(申请/审核) → transporting(运输) →
+    # delivered(交付) / failed(失败回退) / rejected(拒绝) 的完整状态链。
+    # MutableList.as_mutable：原地 append/修改也会被追踪落库
+    trade_orders = Column(MutableList.as_mutable(JSON), nullable=False, default=list)
+    # 最近一次贸易救援动作（审核/拒绝/归档）的幂等凭据，作用与 last_resolution 相同：
+    # 并发落败/连点请求据此安全回放，不二次扣押金/不重复入库物资
+    last_trade = Column(JSON, nullable=True)
     outcome = Column(JSON, nullable=True)  # 结局详情
     score = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, server_default=func.now())

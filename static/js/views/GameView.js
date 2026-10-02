@@ -14,6 +14,11 @@ window.GameView = {
       showExpeditionDialog: false,
       expMembers: [],
       expSupplies: { food: 0, water: 0 },
+      // 贸易救援
+      offers: [],
+      showTradeDialog: false,
+      tradeOfferKey: "",
+      tradeEscorts: [],
     };
   },
   created() { this.init(); },
@@ -155,6 +160,76 @@ window.GameView = {
       } catch (e) { this.error = e.message; await this.loadSession(); }
       finally { this.loading = false; }
     },
+    // ---- 贸易救援 ----
+    async loadOffers() {
+      try { this.offers = await Api.get(`/api/sessions/${this.sid}/trade/offers`); }
+      catch (e) { this.error = e.message; }
+    },
+    async openTradeTab() {
+      this.tab = "trade";
+      await this.loadOffers();
+    },
+    openTradeDialog(key) {
+      this.tradeOfferKey = key;
+      this.tradeEscorts = [];
+      this.showTradeDialog = true;
+    },
+    toggleTradeEscort(id) {
+      const i = this.tradeEscorts.indexOf(id);
+      if (i >= 0) this.tradeEscorts.splice(i, 1);
+      else {
+        if (this.tradeEscorts.length >= 2) { this.error = "每张订单最多 2 名押运员"; return; }
+        this.tradeEscorts.push(id);
+      }
+    },
+    async submitTradeApply() {
+      this.error = "";
+      if (this.actionLocked) return;
+      this.loading = true;
+      try {
+        this.s = (await Api.post(`/api/sessions/${this.sid}/trade/apply`, {
+          offer_key: this.tradeOfferKey,
+          escort_ids: this.tradeEscorts,
+        })).session;
+        this.showTradeDialog = false;
+      } catch (e) { this.error = e.message; }
+      finally { this.loading = false; }
+    },
+    async reviewOrder(o, approve) {
+      this.error = "";
+      if (this.actionLocked) return;
+      this.loading = true;
+      try {
+        this.s = (await Api.post(`/api/sessions/${this.sid}/trade/${o.id}/review`, {
+          approve, token: o.token,
+        })).session;
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+      finally { this.loading = false; }
+    },
+    async dismissOrder(o) {
+      this.error = "";
+      this.loading = true;
+      try {
+        this.s = await Api.del(`/api/sessions/${this.sid}/trade/${o.id}`);
+      } catch (e) { this.error = e.message; }
+      finally { this.loading = false; }
+    },
+    orderEscortNames(o) {
+      return (o.escorts || []).map(id => {
+        const r = this.s.residents.find(x => x.id === id);
+        return r ? r.name : "?";
+      }).join("、") || "无押运";
+    },
+    tradeStatusZh(st) {
+      return ({
+        applied: "申请/审核",
+        transporting: "运输在途",
+        delivered: "已交付",
+        failed: "失败回退",
+        rejected: "已拒绝",
+        aborted: "已中止",
+      })[st] || st;
+    },
     expMemberNames() {
       if (!this.s || !this.s.expedition) return "";
       const ids = this.s.expedition.members || [];
@@ -205,6 +280,21 @@ window.GameView = {
       const ids = this.s.expedition.members || [];
       return ids.filter(id => this.s.residents.some(r => r.id === id)).length;
     },
+    // ---- 贸易救援 ----
+    tradeActiveOrders() {
+      return (this.s?.trade_orders || []).filter(o => ["applied", "transporting"].includes(o.status));
+    },
+    tradeHistoryOrders() {
+      // 终态订单逆序展示（最新在前）
+      return (this.s?.trade_orders || [])
+        .filter(o => ["delivered", "failed", "rejected", "aborted"].includes(o.status))
+        .slice().reverse();
+    },
+    inboundPendingOrders() {
+      return (this.s?.trade_orders || []).filter(
+        o => o.status === "applied" && o.review_by === "bunker"
+      );
+    },
   },
   template: `
   <div v-if="s" class="game" :class="clazz(s.status)">
@@ -213,6 +303,7 @@ window.GameView = {
       <div class="brand">末日地堡<i class="bar"></i></div>
       <div class="day">{{ s.day }}<small>/{{ s.target_day }} 天</small></div>
       <div class="top-right">
+        <span class="chip rep" title="对外信誉：影响外部接单概率、商路风险与可申请订单">信誉 {{ s.reputation }}</span>
         <span class="chip" :class="s.status">{{ s.status === 'running' ? '进行中' : s.status === 'win' ? '胜利' : '失败' }}</span>
         <button class="btn ghost small" @click="onExit">返回档案</button>
       </div>
@@ -237,6 +328,7 @@ window.GameView = {
         <button :class="{ active: tab==='overview' }" @click="tab='overview'">总览</button>
         <button :class="{ active: tab==='residents' }" @click="tab='residents'">幸存者 ({{ alive.length }})</button>
         <button :class="{ active: tab==='expedition' }" @click="tab='expedition'">探索队<template v-if="s.expedition"> ({{ expMemberCount }})</template></button>
+        <button :class="{ active: tab==='trade' }" @click="openTradeTab">商路救援<template v-if="inboundPendingOrders.length"> ({{ inboundPendingOrders.length }})</template></button>
         <button :class="{ active: tab==='build' }" @click="tab='build'">设施扩建</button>
         <button :class="{ active: tab==='log' }" @click="tab='log'">大事记</button>
       </nav>
@@ -264,7 +356,7 @@ window.GameView = {
         <div v-for="r in s.residents" :key="r.id" class="person" :class="{ dead: !r.alive, away: r.away }">
           <div class="p-avatar">{{ r.name[0] }}</div>
           <div class="p-info">
-            <div class="p-name">{{ r.name }} <span class="dim">{{ r.job_zh }}</span><span v-if="r.away" class="chip away-tag">探索中</span></div>
+            <div class="p-name">{{ r.name }} <span class="dim">{{ r.job_zh }}</span><span v-if="r.away" class="chip away-tag">{{ r.away_kind === 'escort' ? '押运中' : '探索中' }}</span></div>
             <div class="meter"><i>健康</i><span class="track"><span class="fill" :style="{width: r.health+'%', background:'#4caf50'}"></span></span><b>{{ fmt(r.health) }}</b></div>
             <div class="meter"><i>士气</i><span class="track"><span class="fill" :style="{width: r.morale+'%', background:'#ffb300'}"></span></span><b>{{ fmt(r.morale) }}</b></div>
           </div>
@@ -302,6 +394,95 @@ window.GameView = {
               {{ crisis ? '请先处理危机' : expPending ? '请先处理遭遇' : '立即返程' }}
             </button>
             <span class="dim" v-if="!actionLocked">返程时统一结算战利品与伤亡</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 商路救援 -->
+      <div v-if="tab==='trade'">
+        <div class="trade-head">
+          <div class="dim">与外部聚落围绕订单、物资和信誉协商：申请 → 审核 → 运输 → 交付（失败则回退）。信誉越高，外部越愿意接单、商路越安全。</div>
+          <button class="btn small primary" :disabled="s.status!=='running' || actionLocked || tradeActiveOrders.length >= 3"
+            @click="loadOffers(); openTradeDialog('')">
+            申请贸易/救援
+          </button>
+        </div>
+
+        <!-- 外部申请待审核 -->
+        <div v-if="inboundPendingOrders.length" class="trade-section">
+          <h3 class="trade-h">📨 外部队伍求援（待你审核）</h3>
+          <div v-for="o in inboundPendingOrders" :key="o.id" class="order-card inbound">
+            <div class="order-top">
+              <span class="order-title">{{ o.title }}</span>
+              <span class="chip" :class="o.kind">{{ o.kind === 'rescue' ? '救援' : '贸易' }}</span>
+              <span class="dim">来自 {{ o.party }} · 第 {{ o.expire_day }} 天截止</span>
+            </div>
+            <div class="order-terms">
+              <span v-for="(v,k) in o.payment" :key="'p'+k" class="term pay">支付 {{ {food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] }} {{ v }}</span>
+              <span v-for="(v,k) in o.reward" :key="'r'+k" class="term reward">回报 {{ {food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] }} +{{ v }}</span>
+              <span v-if="o.add_survivor" class="term reward">获救者加入地堡</span>
+              <span v-if="o.morale_bonus" class="term">士气 {{ o.morale_bonus > 0 ? '+' : '' }}{{ o.morale_bonus }}</span>
+            </div>
+            <div class="order-actions">
+              <button class="btn small primary" :disabled="s.status!=='running' || actionLocked" @click="reviewOrder(o, true)">批准（托管押金）</button>
+              <button class="btn small danger" :disabled="s.status!=='running' || actionLocked" @click="reviewOrder(o, false)">拒绝</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 在途/待审订单 -->
+        <div v-if="tradeActiveOrders.length" class="trade-section">
+          <h3 class="trade-h">🚚 进行中的订单</h3>
+          <div v-for="o in tradeActiveOrders" :key="o.id" class="order-card">
+            <div class="order-top">
+              <span class="order-title">{{ o.title }}</span>
+              <span class="chip" :class="o.kind">{{ o.kind === 'rescue' ? '救援' : '贸易' }}</span>
+              <span class="order-status" :class="o.status">{{ tradeStatusZh(o.status) }}</span>
+              <span class="dim">{{ o.party }}</span>
+            </div>
+            <div class="order-terms">
+              <span v-for="(v,k) in o.payment" :key="'p'+k" class="term pay">押金 {{ {food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] }} {{ v }}</span>
+              <span v-for="(v,k) in o.reward" :key="'r'+k" class="term reward">回报 {{ {food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] }} +{{ v }}</span>
+              <span class="term dim">押运：{{ orderEscortNames(o) }}</span>
+            </div>
+            <div v-if="o.status==='transporting'" class="order-progress">
+              商队在途：第 {{ o.elapsed_days }} / {{ o.travel_days }} 天
+            </div>
+            <div v-else-if="o.review_by==='external'" class="order-progress dim">
+              已发出申请，等待「{{ o.party }}」审核
+            </div>
+          </div>
+        </div>
+
+        <!-- 可申请订单 -->
+        <div class="trade-section">
+          <h3 class="trade-h">📜 商路告示（可主动申请）</h3>
+          <div v-if="!offers.length" class="dim">加载中…</div>
+          <div class="offer-grid">
+            <div v-for="o in offers" :key="o.key" class="build-card">
+              <span class="bc-name">{{ o.title }}</span>
+              <span class="chip" :class="o.kind">{{ o.kind === 'rescue' ? '救援' : '贸易' }}</span>
+              <span class="dim">{{ o.desc }}</span>
+              <span class="cost" v-for="(v,k) in o.payment" :key="k">押金 {{ {food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] }} {{ v }}</span>
+              <span class="dim">回报：<template v-for="(v,k) in o.reward" :key="k">{{ {food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] }}+{{ v }} </template><template v-if="o.add_survivor">幸存者加入 </template></span>
+              <span class="dim">在途 {{ o.travel_days }} 天 · 基础风险 {{ Math.round(o.risk*100) }}% · 信誉 +{{ o.rep_bonus }}<template v-if="o.morale_bonus"> · 士气 +{{ o.morale_bonus }}</template></span>
+              <button class="btn small primary" :disabled="s.status!=='running' || actionLocked || tradeActiveOrders.length >= 3"
+                @click="openTradeDialog(o.key)">申请</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 历史订单 -->
+        <div v-if="tradeHistoryOrders.length" class="trade-section">
+          <h3 class="trade-h">📦 订单记录</h3>
+          <div v-for="o in tradeHistoryOrders" :key="o.id" class="order-card history" :class="o.status">
+            <div class="order-top">
+              <span class="order-title">{{ o.title }}</span>
+              <span class="order-status" :class="o.status">{{ tradeStatusZh(o.status) }}</span>
+              <span class="dim">{{ o.party }} · {{ o.result && (o.result.reason || '') }}</span>
+              <button class="btn tiny ghost" @click="dismissOrder(o)">归档</button>
+            </div>
+            <div v-if="o.result && o.result.detail" class="order-result dim">{{ o.result.detail }}</div>
           </div>
         </div>
       </div>
@@ -401,6 +582,42 @@ window.GameView = {
           </button>
           <button class="choice" @click="showExpeditionDialog=false"><strong>取消</strong></button>
         </div>
+      </div>
+    </div>
+
+    <!-- 申请贸易/救援弹层 -->
+    <div v-if="showTradeDialog" class="overlay">
+      <div class="crisis expedition trade-dialog">
+        <h2>申请贸易 / 救援</h2>
+        <p class="crisis-desc">选择一笔商路订单并可选派押运员（最多 2 人）。申请需经外部聚落审核，通过后托管押金、商队启程；押运员离堡期间暂停地堡生产与消耗。</p>
+        <div v-if="!tradeOfferKey" class="trade-offer-pick">
+          <div v-for="o in offers" :key="o.key" class="trade-offer" @click="openTradeDialog(o.key)">
+            <div class="to-top">
+              <strong>{{ o.title }}</strong>
+              <span class="chip" :class="o.kind">{{ o.kind === 'rescue' ? '救援' : '贸易' }}</span>
+            </div>
+            <div class="dim">{{ o.desc }}</div>
+            <div class="dim">押金：<template v-for="(v,k) in o.payment" :key="k">{{ {food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] }} {{ v }} </template>｜回报：<template v-for="(v,k) in o.reward" :key="k">{{ {food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] }}+{{ v }} </template><template v-if="o.add_survivor">+幸存者 </template>｜在途 {{ o.travel_days }} 天</div>
+          </div>
+          <div v-if="!offers.length" class="dim">当前信誉暂无可申请订单</div>
+        </div>
+        <template v-else>
+          <div class="exp-member-pick">
+            <div v-for="r in inBunkerAlive" :key="r.id" class="exp-member" :class="{ selected: tradeEscorts.includes(r.id) }" @click="toggleTradeEscort(r.id)">
+              <span class="p-avatar">{{ r.name[0] }}</span>
+              <span>{{ r.name }}</span>
+              <span class="dim">{{ r.job_zh }}</span>
+            </div>
+            <div v-if="!inBunkerAlive.length" class="dim">没有可选的在堡居民（可无押运申请）</div>
+          </div>
+          <div class="choices">
+            <button class="choice primary-choice" @click="submitTradeApply" :disabled="loading">
+              <strong>{{ loading ? '提交中…' : '提交申请' }}</strong>
+            </button>
+            <button class="choice" @click="openTradeDialog('')"><strong>重选订单</strong></button>
+            <button class="choice" @click="showTradeDialog=false"><strong>取消</strong></button>
+          </div>
+        </template>
       </div>
     </div>
   </div>`,
