@@ -43,6 +43,16 @@ class GameSession(Base):
     # 落库后刷新可恢复同一支队伍；为 None 表示当前没有在外的探索队。
     # MutableDict.as_mutable：原地修改 JSON 字段（如 exp["travel_days"]=1）也会被追踪落库
     expedition = Column(MutableDict.as_mutable(JSON), nullable=True)
+    # 贸易/救援订单快照（含一次性 token、交易对手、押运队、托管物资、在途货物、
+    # 运输天数与途中事件），落库后刷新可恢复同一订单；为 None 表示当前没有在谈订单。
+    # 状态链：reviewing(申请待审) → transporting(押运运输) → delivered/failed/rejected/cancelled
+    trade_order = Column(MutableDict.as_mutable(JSON), nullable=True)
+    # 最近一次贸易动作（途中事件抉择/事件直接触发的失败收敛）的幂等凭据，
+    # 作用与 last_expedition 相同：订单在动作完成后即被清除时，凭此仍能识别
+    # 并发落败/连点的重复请求并安全回放
+    last_trade = Column(JSON, nullable=True)
+    # 地堡对外信誉 0-100：影响外部聚落的审核通过率与交付成功率，随订单成败升降
+    reputation = Column(Integer, nullable=False, default=50)
     outcome = Column(JSON, nullable=True)  # 结局详情
     score = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, server_default=func.now())

@@ -14,6 +14,12 @@ window.GameView = {
       showExpeditionDialog: false,
       expMembers: [],
       expSupplies: { food: 0, water: 0 },
+      // 贸易救援
+      market: null,
+      marketLoading: false,
+      showTradeDialog: false,
+      tradeOffer: null,
+      tradeEscorts: [],
     };
   },
   created() { this.init(); },
@@ -172,6 +178,78 @@ window.GameView = {
       }
       return parts.join("、") || "暂无";
     },
+    // ---- 贸易救援 ----
+    tradeStatusZh(st) {
+      return { reviewing: "申请审核中", transporting: "押运在途", delivered: "已交付",
+               failed: "已失败回退", rejected: "已驳回", cancelled: "已撤销" }[st] || st;
+    },
+    async openTradeMarket() {
+      this.error = "";
+      this.marketLoading = true;
+      try {
+        this.market = await Api.get(`/api/sessions/${this.sid}/trade/market`);
+        this.showTradeDialog = true;
+      } catch (e) { this.error = e.message; }
+      finally { this.marketLoading = false; }
+    },
+    pickTradeOffer(o) {
+      this.tradeOffer = o;
+      this.tradeEscorts = [];
+    },
+    toggleTradeEscort(id) {
+      const i = this.tradeEscorts.indexOf(id);
+      if (i >= 0) this.tradeEscorts.splice(i, 1);
+      else {
+        if (this.tradeEscorts.length >= 3) { this.error = "押运队最多 3 人"; return; }
+        this.tradeEscorts.push(id);
+      }
+    },
+    async submitTrade() {
+      this.error = "";
+      if (!this.tradeOffer) { this.error = "请选择一项报价"; return; }
+      if (!this.tradeEscorts.length) { this.error = "必须指定至少一名押运队员"; return; }
+      this.loading = true;
+      try {
+        this.s = await Api.post(`/api/sessions/${this.sid}/trade/apply`, {
+          offer_id: this.tradeOffer.id,
+          escort_ids: this.tradeEscorts,
+        });
+        this.showTradeDialog = false;
+        this.tradeOffer = null;
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+      finally { this.loading = false; }
+    },
+    async cancelTrade() {
+      this.error = "";
+      this.loading = true;
+      try {
+        this.s = await Api.post(`/api/sessions/${this.sid}/trade/cancel`, {
+          token: this.s.trade_order.token,
+        });
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+      finally { this.loading = false; }
+    },
+    async resolveTradeIncident(c) {
+      this.error = "";
+      this.loading = true;
+      try {
+        const body = { choice_key: c.key, token: this.s.trade_order.pending_incident.token };
+        this.s = await Api.post(`/api/sessions/${this.sid}/trade/resolve`, body);
+      } catch (e) { this.error = e.message; await this.loadSession(); }
+      finally { this.loading = false; }
+    },
+    tradeEscortNames() {
+      if (!this.s || !this.s.trade_order) return "";
+      return (this.s.trade_order.escorts || []).map(id => {
+        const r = this.s.residents.find(x => x.id === id);
+        return r ? r.name : "?";
+      }).join("、");
+    },
+    fmtTradeBags(bag) {
+      return Object.entries(bag || {}).map(([k, v]) =>
+        `${{food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] || k} ${Math.round(v)}`
+      ).join("、");
+    },
     resPct(k) {
       const cap = { food: 300, water: 300, power: 200, oxygen: 200 };
       const c = cap[k] || 100;
@@ -187,13 +265,20 @@ window.GameView = {
     expPending() {
       return !!(this.s && this.s.expedition && this.s.expedition.pending_encounter);
     },
-    // 抉择锁：地堡危机或探索遭遇待处理时，推进与一切经营动作统一禁用
+    tradeOrder() {
+      return this.s ? this.s.trade_order : null;
+    },
+    tradePending() {
+      return !!(this.s && this.s.trade_order && this.s.trade_order.pending_incident);
+    },
+    // 抉择锁：地堡危机/探索遭遇/途中事件待处理时，推进与一切经营动作统一禁用
     actionLocked() {
-      return !!(this.crisis || this.expPending);
+      return !!(this.crisis || this.expPending || this.tradePending);
     },
     pendingTitle() {
       if (this.crisis) return "请先处理当前危机";
       if (this.expPending) return "请先处理探索遭遇";
+      if (this.tradePending) return "请先处理途中事件";
       return "";
     },
     inBunkerAlive() {
@@ -213,6 +298,7 @@ window.GameView = {
       <div class="brand">末日地堡<i class="bar"></i></div>
       <div class="day">{{ s.day }}<small>/{{ s.target_day }} 天</small></div>
       <div class="top-right">
+        <span class="chip rep" title="对外信誉：影响外部聚落的审核与交付">信誉 {{ s.reputation }}</span>
         <span class="chip" :class="s.status">{{ s.status === 'running' ? '进行中' : s.status === 'win' ? '胜利' : '失败' }}</span>
         <button class="btn ghost small" @click="onExit">返回档案</button>
       </div>
@@ -226,7 +312,7 @@ window.GameView = {
         <div class="res-track"><div class="res-fill" :class="k" :style="{ width: resPct(k)+'%' }"></div></div>
       </div>
       <button class="btn primary advance" :disabled="loading || s.status!=='running' || actionLocked" :title="pendingTitle" @click="advance">
-        {{ crisis ? '等待危机抉择' : expPending ? '等待探索遭遇抉择' : loading ? '推进中…' : '推进一天' }}
+        {{ crisis ? '等待危机抉择' : expPending ? '等待探索遭遇抉择' : tradePending ? '等待途中事件抉择' : loading ? '推进中…' : '推进一天' }}
       </button>
     </section>
     <div v-if="error" class="msg err global">{{ error }}</div>
@@ -237,6 +323,7 @@ window.GameView = {
         <button :class="{ active: tab==='overview' }" @click="tab='overview'">总览</button>
         <button :class="{ active: tab==='residents' }" @click="tab='residents'">幸存者 ({{ alive.length }})</button>
         <button :class="{ active: tab==='expedition' }" @click="tab='expedition'">探索队<template v-if="s.expedition"> ({{ expMemberCount }})</template></button>
+        <button :class="{ active: tab==='trade' }" @click="tab='trade'">贸易救援<template v-if="s.trade_order"> ●</template></button>
         <button :class="{ active: tab==='build' }" @click="tab='build'">设施扩建</button>
         <button :class="{ active: tab==='log' }" @click="tab='log'">大事记</button>
       </nav>
@@ -264,7 +351,7 @@ window.GameView = {
         <div v-for="r in s.residents" :key="r.id" class="person" :class="{ dead: !r.alive, away: r.away }">
           <div class="p-avatar">{{ r.name[0] }}</div>
           <div class="p-info">
-            <div class="p-name">{{ r.name }} <span class="dim">{{ r.job_zh }}</span><span v-if="r.away" class="chip away-tag">探索中</span></div>
+            <div class="p-name">{{ r.name }} <span class="dim">{{ r.job_zh }}</span><span v-if="r.away" class="chip away-tag">{{ r.trade_status === 'transporting' ? '押运中' : '探索中' }}</span><span v-if="r.trade_status==='reviewing'" class="chip review-tag">待押运</span></div>
             <div class="meter"><i>健康</i><span class="track"><span class="fill" :style="{width: r.health+'%', background:'#4caf50'}"></span></span><b>{{ fmt(r.health) }}</b></div>
             <div class="meter"><i>士气</i><span class="track"><span class="fill" :style="{width: r.morale+'%', background:'#ffb300'}"></span></span><b>{{ fmt(r.morale) }}</b></div>
           </div>
@@ -302,6 +389,51 @@ window.GameView = {
               {{ crisis ? '请先处理危机' : expPending ? '请先处理遭遇' : '立即返程' }}
             </button>
             <span class="dim" v-if="!actionLocked">返程时统一结算战利品与伤亡</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 贸易救援 -->
+      <div v-if="tab==='trade'">
+        <div class="exp-panel">
+          <!-- 无在谈订单：打开市场 -->
+          <div v-if="!s.trade_order" class="exp-empty">
+            <p>与外部聚落协商救援或采购订单：托管物资、组建押运队，
+               经对方审核后离堡运输，途中可能遭遇截道与沙暴，抵达后交付结算。</p>
+            <p class="dim">审核/交付成功率受信誉影响；成功换来物资与口碑，失败则剩余货物退回、信誉下降。</p>
+            <button class="btn primary" :disabled="s.status!=='running' || actionLocked || !!s.expedition"
+                    @click="openTradeMarket">
+              {{ marketLoading ? '联络中…' : '联络外部聚落' }}
+            </button>
+            <div v-if="s.expedition" class="dim" style="margin-top:8px">探索队在外期间无法办理贸易订单</div>
+          </div>
+          <!-- 在谈/在途订单 -->
+          <div v-else class="exp-status">
+            <div class="exp-row">
+              <span class="k">状态</span>
+              <span class="v">
+                <span class="chip" :class="s.trade_order.status">{{ tradeStatusZh(s.trade_order.status) }}</span>
+                <b style="margin-left:8px">{{ s.trade_order.type === 'rescue' ? '紧急救援' : '对外采购' }} · {{ s.trade_order.partner_name }}</b>
+              </span>
+            </div>
+            <div class="exp-row"><span class="k">押运队员</span><span class="v">{{ tradeEscortNames() }}</span></div>
+            <div class="exp-row"><span class="k">托管物资（已冻结）</span><span class="v">{{ fmtTradeBags(s.trade_order.escrow) }}</span></div>
+            <div class="exp-row"><span class="k">{{ s.trade_order.type === 'rescue' ? '对方回礼' : '采购到货' }}</span><span class="v loot">{{ fmtTradeBags(s.trade_order.cargo) }}</span></div>
+            <div class="exp-row" v-if="s.trade_order.status==='transporting'">
+              <span class="k">在途进度</span>
+              <span class="v">第 {{ s.trade_order.travel_days }} / {{ s.trade_order.eta }} 天
+                · 货物残存 {{ Math.round((s.trade_order.cargo_ratio || 1) * 100) }}%</span>
+            </div>
+            <div class="exp-row" v-if="s.trade_order.incidents_resolved">
+              <span class="k">已处理途中事件</span><span class="v">{{ s.trade_order.incidents_resolved }} 次</span>
+            </div>
+            <div class="exp-actions">
+              <button v-if="s.trade_order.status==='reviewing'" class="btn danger"
+                      :disabled="s.status!=='running' || actionLocked" @click="cancelTrade">撤单并退还托管</button>
+              <span class="dim" v-if="s.trade_order.status==='reviewing'">审核结果将在下一次推进时公布；撤单全额退还</span>
+              <span class="dim" v-if="s.trade_order.status==='transporting' && !tradePending">押运队在途，推进一天以继续运输</span>
+              <span class="dim" v-if="tradePending" style="color:var(--warn)">途中出现突发状况，请先抉择</span>
+            </div>
           </div>
         </div>
       </div>
@@ -374,6 +506,83 @@ window.GameView = {
             <span class="hint">{{ c.hint }}</span>
           </button>
         </div>
+      </div>
+    </div>
+
+    <!-- 贸易途中事件弹层 -->
+    <div v-if="tradePending" class="overlay">
+      <div class="crisis trade">
+        <h2>🤝 {{ s.trade_order.pending_incident.title }}</h2>
+        <p class="crisis-desc">{{ s.trade_order.pending_incident.desc }}</p>
+        <div v-if="s.trade_order.pending_incident.needs_target" class="crisis-tgt">
+          相关队员：{{ s.trade_order.pending_incident.target_name }}<span class="dim">（仅标注「单人」的决策作用于本人，其余对全体押运队员生效）</span>
+        </div>
+        <div class="choices">
+          <button v-for="c in s.trade_order.pending_incident.choices" :key="c.key" class="choice" @click="resolveTradeIncident(c)">
+            <strong>{{ c.label }}</strong>
+            <span class="scope-tag" :class="{ solo: c.targeted }">{{ c.targeted ? '单人' : '全队' }}</span>
+            <span class="hint">{{ c.hint }}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 贸易市场弹层 -->
+    <div v-if="showTradeDialog" class="overlay">
+      <div class="crisis trade market-dialog">
+        <h2>📡 外部聚落通讯</h2>
+        <p class="crisis-desc">第 {{ market.day }} 天的报价（市场每日轮换）。当前信誉 <b>{{ market.reputation }}</b>，信誉越高审核与交付越顺利。</p>
+        <!-- 报价列表 / 押运队员选择 两级视图 -->
+        <template v-if="!tradeOffer">
+          <div class="market-list">
+            <div v-for="o in market.offers" :key="o.id" class="market-offer" :class="o.type" @click="pickTradeOffer(o)">
+              <div class="mo-head">
+                <span class="chip" :class="o.type">{{ o.type === 'rescue' ? '求援' : '采购' }}</span>
+                <strong>{{ o.partner_name }}</strong>
+                <span class="dim">单程约 {{ o.eta }} 天</span>
+              </div>
+              <div class="mo-flow">
+                <span>付出：<b>{{ fmtTradeBags(o.escrow) }}</b></span>
+                <span>→</span>
+                <span class="loot">{{ o.type === 'rescue' ? '回礼' : '到货' }}：<b>{{ fmtTradeBags(o.cargo) }}</b></span>
+              </div>
+              <div class="dim">{{ o.hint }}</div>
+            </div>
+          </div>
+          <div class="choices">
+            <button class="choice" @click="showTradeDialog=false"><strong>关闭</strong></button>
+          </div>
+        </template>
+        <template v-else>
+          <div class="market-offer" :class="tradeOffer.type">
+            <div class="mo-head">
+              <span class="chip" :class="tradeOffer.type">{{ tradeOffer.type === 'rescue' ? '求援' : '采购' }}</span>
+              <strong>{{ tradeOffer.partner_name }}</strong>
+              <span class="dim">单程约 {{ tradeOffer.eta }} 天</span>
+            </div>
+            <div class="mo-flow">
+              <span>托管：<b>{{ fmtTradeBags(tradeOffer.escrow) }}</b></span>
+              <span>→</span>
+              <span class="loot">{{ tradeOffer.type === 'rescue' ? '回礼' : '到货' }}：<b>{{ fmtTradeBags(tradeOffer.cargo) }}</b></span>
+            </div>
+          </div>
+          <p class="dim" style="margin:10px 0 4px">选择押运队员（1-3 人，须在堡且存活）：</p>
+          <div class="exp-member-pick">
+            <div v-for="r in inBunkerAlive" :key="r.id" class="exp-member"
+                 :class="{ selected: tradeEscorts.includes(r.id) }" @click="toggleTradeEscort(r.id)">
+              <span class="p-avatar">{{ r.name[0] }}</span>
+              <span>{{ r.name }}</span>
+              <span class="dim">{{ r.job_zh }}</span>
+            </div>
+            <div v-if="!inBunkerAlive.length" class="dim">没有可派出的在堡居民</div>
+          </div>
+          <div class="choices">
+            <button class="choice primary-choice" :disabled="loading || !tradeEscorts.length" @click="submitTrade">
+              <strong>{{ loading ? '提交中…' : '冻结托管并提交申请' }}</strong>
+            </button>
+            <button class="choice" @click="tradeOffer=null"><strong>返回报价列表</strong></button>
+          </div>
+        </template>
       </div>
     </div>
 

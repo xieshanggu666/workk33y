@@ -292,3 +292,205 @@ def test_fatal_encounter_wrong_choice_after_convergence_409(client):
         "choice_key": "take_shelter", "token": team["token"],
     })
     assert r.status_code == 409
+
+
+# ---- 贸易救援 HTTP 端到端 ----
+
+def test_trade_market_endpoint(client):
+    """市场只读端点：返回当日报价与信誉。"""
+    r = client.post("/api/sessions", json={"name": "trade"})
+    sid = r.json()["id"]
+    r = client.get(f"/api/sessions/{sid}/trade/market")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["day"] == 1
+    assert body["reputation"] == 50
+    assert len(body["offers"]) == 4
+
+
+def test_trade_full_success_flow(client, monkeypatch):
+    """申请→审核→在途(无事件)→交付成功：状态链经 HTTP 完整走通。"""
+    from app.services import engine as engine_mod
+
+    # 每个 HTTP 请求都会新建引擎并重新调用 _rng()，因此脚本必须是共享单例。
+    # 第一个 advance 实际消耗三个值：审核通过 0.1、在途事件掷点 0.1（必触发）、
+    # 事件选择 0.9（不挂起的处理不需要——这里直接选 eta=2 且让事件掷点落空）。
+    # 为稳妥给足：审核 0.1、首日无事件 0.9、抵达交付成功 0.1
+    state = {"vals": [0.1, 0.9, 0.9, 0.1, 0.9, 0.9]}
+
+    class ScriptedMarket:
+        def random(self):
+            return state["vals"].pop(0) if state["vals"] else 0.9
+
+        def choice(self, seq_):
+            return seq_[0]
+
+    _scripted = ScriptedMarket()
+    monkeypatch.setattr(engine_mod, "_rng", lambda: _scripted)
+
+    r = client.post("/api/sessions", json={"name": "trade"})
+    sid = r.json()["id"]
+    escort = r.json()["residents"][0]["id"]
+    market = client.get(f"/api/sessions/{sid}/trade/market").json()
+    # 岭上镇求援：eta 2，day2 出发、day3 抵达
+    offer = next(
+        o for o in market["offers"]
+        if o["type"] == "rescue" and o["partner"] == "ridge"
+    )
+
+    # 申请
+    r = client.post(f"/api/sessions/{sid}/trade/apply", json={
+        "offer_id": offer["id"], "escort_ids": [escort],
+    })
+    assert r.status_code == 200
+    order = r.json()["trade_order"]
+    assert order["status"] == "reviewing"
+    # 审核中押运队员仍在堡：away=0
+    assert r.json()["residents"][0]["away"] == 0
+    assert r.json()["residents"][0]["trade_status"] == "reviewing"
+
+    # day2：审核通过 + 第一个在途日
+    r = client.post(f"/api/sessions/{sid}/advance")
+    assert r.status_code == 200
+    body = r.json()["session"]
+    assert body["trade_order"]["status"] == "transporting"
+    assert body["residents"][0]["away"] == 1
+    assert body["trade_order"]["travel_days"] == 1
+
+    # day3：抵达交付成功
+    r = client.post(f"/api/sessions/{sid}/advance")
+    assert r.status_code == 200
+    body = r.json()["session"]
+    assert body["trade_order"] is None
+    assert body["reputation"] == 56
+
+
+def test_trade_incident_http_cycle(client, monkeypatch):
+    """在途事件经 HTTP 挂起→结算：pending_event 带回事件，resolve 后清除。"""
+    from app.services import engine as engine_mod
+
+    vals = [0.1, 0.1, 0.9, 0.9]  # 审核通过、触发途中事件（富余值防止耗尽）
+
+    class Scripted:
+        def random(self):
+            return vals.pop(0) if vals else 0.9
+
+        def choice(self, seq_):
+            return seq_[0]
+
+    _scripted = Scripted()
+    monkeypatch.setattr(engine_mod, "_rng", lambda: _scripted)
+
+    r = client.post("/api/sessions", json={"name": "trade2"})
+    sid = r.json()["id"]
+    escort = r.json()["residents"][0]["id"]
+    market = client.get(f"/api/sessions/{sid}/trade/market").json()
+    offer = next(o for o in market["offers"] if o["type"] == "rescue")
+    client.post(f"/api/sessions/{sid}/trade/apply", json={
+        "offer_id": offer["id"], "escort_ids": [escort],
+    })
+    r = client.post(f"/api/sessions/{sid}/advance")
+    body = r.json()
+    assert body["pending_event"] is not None
+    assert body["session"]["trade_order"]["pending_incident"]["event"] == body["pending_event"]["event"]
+    token = body["pending_event"]["token"]
+
+    # 事件待处理期间经营动作被后端拒绝
+    r = client.post(f"/api/sessions/{sid}/build", json={"category": "med"})
+    assert r.status_code == 400
+
+    r = client.post(f"/api/sessions/{sid}/trade/resolve", json={
+        "choice_key": "pay_toll", "token": token,
+    })
+    assert r.status_code == 200
+    assert r.json()["trade_order"]["cargo_ratio"] == 0.7
+    assert r.json()["trade_order"]["pending_incident"] is None
+
+
+def test_trade_cancel_http_refund(client):
+    """审核阶段撤单：托管退还，订单清除；重复撤单 200 幂等。"""
+    r = client.post("/api/sessions", json={"name": "trade3"})
+    sid = r.json()["id"]
+    escort = r.json()["residents"][0]["id"]
+    market = client.get(f"/api/sessions/{sid}/trade/market").json()
+    offer = market["offers"][0]
+    before = client.get(f"/api/sessions/{sid}").json()["resources"]
+    client.post(f"/api/sessions/{sid}/trade/apply", json={
+        "offer_id": offer["id"], "escort_ids": [escort],
+    })
+    frozen = client.get(f"/api/sessions/{sid}").json()
+    token = frozen["trade_order"]["token"]
+    r = client.post(f"/api/sessions/{sid}/trade/cancel", json={"token": token})
+    assert r.status_code == 200
+    assert r.json()["trade_order"] is None
+    assert r.json()["resources"] == before
+    # 重复撤单：幂等回放，不二次退款
+    r2 = client.post(f"/api/sessions/{sid}/trade/cancel", json={"token": token})
+    assert r2.status_code == 200
+    assert r2.json()["resources"] == before
+
+
+def test_trade_apply_rejects_expired_offer_http(client):
+    """跨天后用旧报价下单 → 400。"""
+    r = client.post("/api/sessions", json={"name": "trade4"})
+    sid = r.json()["id"]
+    escort = r.json()["residents"][0]["id"]
+    market = client.get(f"/api/sessions/{sid}/trade/market").json()
+    old_id = market["offers"][0]["id"]
+    # 用引擎直接推进一天（旧报价随市场轮换失效）
+    db = SessionLocal()
+    try:
+        gs = db.get(GameSession, sid)
+        BunkerEngine(db, gs).advance_day()
+        db.commit()
+    finally:
+        db.close()
+    r = client.post(f"/api/sessions/{sid}/trade/apply", json={
+        "offer_id": old_id, "escort_ids": [escort],
+    })
+    assert r.status_code == 400
+
+
+def test_trade_concurrent_incident_loser_replays_200(client, monkeypatch):
+    """途中事件并发落败：对家先结算（弃货收敛），落败方同请求重试 → 200 回放。"""
+    from app.services import engine as engine_mod
+
+    class Scripted:
+        def random(self):
+            return 0.1  # 审核通过、事件触发
+
+        def choice(self, seq_):
+            return seq_[0]
+
+    _scripted = Scripted()
+    monkeypatch.setattr(engine_mod, "_rng", lambda: _scripted)
+
+    r = client.post("/api/sessions", json={"name": "trade5"})
+    sid = r.json()["id"]
+    escort = r.json()["residents"][0]["id"]
+    market = client.get(f"/api/sessions/{sid}/trade/market").json()
+    offer = next(o for o in market["offers"] if o["type"] == "rescue")
+    client.post(f"/api/sessions/{sid}/trade/apply", json={
+        "offer_id": offer["id"], "escort_ids": [escort],
+    })
+    body = client.post(f"/api/sessions/{sid}/advance").json()
+    token = body["pending_event"]["token"]
+
+    # 对家先弃货收敛
+    db = SessionLocal()
+    try:
+        gs = db.get(GameSession, sid)
+        eng = BunkerEngine(db, gs)
+        eng.resolve_trade_incident("abandon", token=token)
+        db.commit()
+    finally:
+        db.close()
+
+    # 落败方同请求重试：200 回放，信誉只扣一次（42）
+    r = client.post(f"/api/sessions/{sid}/trade/resolve", json={
+        "choice_key": "abandon", "token": token,
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["trade_order"] is None
+    assert body["reputation"] == 42

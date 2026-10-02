@@ -194,3 +194,24 @@ select {
 .exp-supplies input { width: 80px; background: var(--bg-soft); border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 6px 8px; font-size: 13px; }
 .choice.primary-choice { border-color: var(--primary); background: rgba(67,200,122,.12); }
 .choice.primary-choice strong { color: var(--primary); }
+/* ---------- 贸易救援 ---------- */
+.chip.rep { color: var(--warn); border-color: rgba(255,179,0,.45); }
+.trade h2 { color: var(--primary); }
+.chip.reviewing, .chip.transporting { color: var(--info); border-color: rgba(76,194,255,.45); }
+.chip.rescue { color: var(--danger); border-color: rgba(229,72,77,.5); }
+.chip.procure { color: var(--primary); border-color: rgba(67,200,122,.5); }
+.review-tag { color: var(--warn); border-color: rgba(255,179,0,.4); margin-left: 6px; }
+.exp-row .v .loot, .market-offer .loot { color: var(--warn); }
+
+.market-dialog { max-width: 560px; }
+.market-list { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; max-height: 52vh; overflow-y: auto; }
+.market-offer {
+  background: var(--bg-soft); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 14px; cursor: pointer; transition: .15s;
+}
+.market-list .market-offer:hover { border-color: var(--primary); }
+.mo-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.mo-head strong { font-size: 15px; }
+.mo-flow { display: flex; align-items: center; gap: 12px; font-size: 13px; margin-bottom: 6px; flex-wrap: wrap; }
+.market-offer.rescue { border-left: 3px solid rgba(229,72,77,.6); }
+.market-offer.procure { border-left: 3px solid rgba(67,200,122,.6); }

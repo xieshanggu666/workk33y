@@ -25,6 +25,9 @@ from ..schemas import (
     ExpeditionSend,
     ExpeditionEncounterChoice,
     ExpeditionReturn,
+    TradeApply,
+    TradeIncidentChoice,
+    TradeCancel,
     JobAssign,
     BuildRequest,
     BuildableInfo,
@@ -97,7 +100,7 @@ def get_session(sid: int, db: Session = Depends(get_db)):
     return get_session_detail(gs, db)
 
 
-def _serialize_resident(r, away_ids=None):
+def _serialize_resident(r, away_ids=None, trade_status=None):
     return {
         "id": r.id,
         "name": r.name,
@@ -107,17 +110,29 @@ def _serialize_resident(r, away_ids=None):
         "morale": r.morale,
         "alive": r.alive,
         "away": 1 if (away_ids and r.id in away_ids) else 0,
+        # 贸易订单角色：transporting=在途押运（按离堡结算）；reviewing=待出发押运（仍在堡）
+        "trade_status": trade_status,
         "joined_day": r.joined_day,
     }
 
 
 def get_session_detail(gs, db):
-    # 探索队成员编号：用于标注居民"探索中"状态
+    # 离堡成员编号（探索队 + 在途贸易押运队）：用于标注居民"探索中/押运中"状态
     away_ids = set()
     if gs.expedition and gs.expedition.get("status") == "away":
         away_ids = set(gs.expedition.get("members", []))
+    trade_tag = {}
+    if gs.trade_order:
+        order = gs.trade_order
+        if order.get("status") == "transporting":
+            for mid in order.get("escorts", []):
+                away_ids.add(mid)
+                trade_tag[mid] = "transporting"
+        elif order.get("status") == "reviewing":
+            for mid in order.get("escorts", []):
+                trade_tag[mid] = "reviewing"
     residents = [
-        _serialize_resident(r, away_ids)
+        _serialize_resident(r, away_ids, trade_tag.get(r.id))
         for r in gs.residents
     ]
     facilities = [
@@ -154,6 +169,8 @@ def get_session_detail(gs, db):
         outcome=gs.outcome,
         pending_crisis=gs.pending_crisis,
         expedition=gs.expedition,
+        trade_order=gs.trade_order,
+        reputation=gs.reputation if gs.reputation is not None else 50,
         residents=residents,
         facilities=facilities,
         logs=logs,
@@ -208,6 +225,9 @@ def advance(sid: int, db: Session = Depends(get_db)):
     # 前端据此恢复对应弹层（落败回放与正常返回保持同一口径）
     if crisis is None and gs.expedition and gs.expedition.get("pending_encounter"):
         crisis = gs.expedition["pending_encounter"]
+    # 贸易押运队在途时推进也可能挂起途中事件，统一走 pending_event 返回
+    if crisis is None and gs.trade_order and gs.trade_order.get("pending_incident"):
+        crisis = gs.trade_order["pending_incident"]
     # pending_event 为语义准确的新字段；crisis 为兼容旧前端的同值别名
     return AdvanceResult(session=get_session_detail(gs, db), pending_event=crisis, crisis=crisis)
 
@@ -310,6 +330,91 @@ def return_expedition(sid: int, body: ExpeditionReturn, db: Session = Depends(ge
         replay_eng = BunkerEngine(db, gs)
         try:
             replay_eng.reconcile_stale_expedition("return", exp_token=body.token)
+        except BunkerEngineConflict as e:
+            raise HTTPException(409, str(e))
+    return get_session_detail(gs, db)
+
+
+# ---- 贸易救援 ----
+@router.get("/sessions/{sid}/trade/market")
+def trade_market(sid: int, db: Session = Depends(get_db)):
+    """当日外部聚落的贸易/救援报价（按天确定性轮换，只读）。"""
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    eng = BunkerEngine(db, gs)
+    return {
+        "day": gs.day,
+        "reputation": gs.reputation if gs.reputation is not None else 50,
+        "offers": eng.trade_market(),
+    }
+
+
+@router.post("/sessions/{sid}/trade/apply", response_model=SessionDetail)
+def trade_apply(sid: int, body: TradeApply, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    _run_mutation(
+        db, gs, lambda eng: eng.apply_trade(body.offer_id, body.escort_ids)
+    )
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/trade/resolve", response_model=SessionDetail)
+def trade_resolve(sid: int, body: TradeIncidentChoice, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    eng = BunkerEngine(db, gs)
+    try:
+        eng.resolve_trade_incident(body.choice_key, token=body.token)
+        db.commit()
+        db.refresh(gs)
+    except BunkerEngineConflict as e:
+        db.rollback()
+        raise HTTPException(409, str(e))
+    except BunkerEngineError as e:
+        db.rollback()
+        raise HTTPException(400, str(e))
+    except StaleDataError:
+        # 并发的重复结算：版本不匹配说明对方已先落库。核对是否同一次途中事件抉择：
+        # 相同（含抉择直接触发失败回退的情形）则幂等回放，否则 409 拒绝
+        db.rollback()
+        db.refresh(gs)
+        replay_eng = BunkerEngine(db, gs)
+        try:
+            replay_eng.reconcile_stale_trade(
+                "incident", token=body.token, choice_key=body.choice_key
+            )
+        except BunkerEngineConflict as e:
+            raise HTTPException(409, str(e))
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/trade/cancel", response_model=SessionDetail)
+def trade_cancel(sid: int, body: TradeCancel, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    eng = BunkerEngine(db, gs)
+    try:
+        eng.cancel_trade(token=body.token)
+        db.commit()
+        db.refresh(gs)
+    except BunkerEngineConflict as e:
+        db.rollback()
+        raise HTTPException(409, str(e))
+    except BunkerEngineError as e:
+        db.rollback()
+        raise HTTPException(400, str(e))
+    except StaleDataError:
+        # 并发撤单落败：同一订单的撤单已落库时幂等回放，托管只退一次
+        db.rollback()
+        db.refresh(gs)
+        replay_eng = BunkerEngine(db, gs)
+        try:
+            replay_eng.reconcile_stale_trade("cancel", token=body.token)
         except BunkerEngineConflict as e:
             raise HTTPException(409, str(e))
     return get_session_detail(gs, db)

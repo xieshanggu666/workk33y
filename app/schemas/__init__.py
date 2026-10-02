@@ -29,6 +29,8 @@ class ResidentOut(BaseModel):
     morale: float
     alive: int
     away: int = 0
+    # 贸易订单角色：transporting=在途押运；reviewing=待出发押运；None=无订单
+    trade_status: Optional[str] = None
     joined_day: int
 
     class Config:
@@ -73,6 +75,10 @@ class SessionDetail(BaseModel):
     pending_crisis: Optional[Dict[str, Any]] = None
     # 探索队状态快照：在外行军/遭遇/返程，刷新后恢复同一支队伍
     expedition: Optional[Dict[str, Any]] = None
+    # 当前贸易/救援订单快照（审核中/在途），终局后清空
+    trade_order: Optional[Dict[str, Any]] = None
+    # 地堡对外信誉 0-100，影响外部聚落审核/交付
+    reputation: int = 50
     residents: List[ResidentOut] = []
     facilities: List[FacilityOut] = []
     logs: List[LogOut] = []
@@ -110,6 +116,24 @@ class ExpeditionEncounterChoice(BaseModel):
 
 class ExpeditionReturn(BaseModel):
     """召回探索队。"""
+    token: Optional[str] = None
+
+
+class TradeApply(BaseModel):
+    """提交贸易/救援订单：选择当日市场报价与押运队员。"""
+    offer_id: str
+    escort_ids: List[int]
+
+
+class TradeIncidentChoice(BaseModel):
+    """处理押运途中事件。"""
+    choice_key: str
+    # 途中事件的一次性凭据，用于识别过期/重复请求
+    token: Optional[str] = None
+
+
+class TradeCancel(BaseModel):
+    """审核阶段撤单。"""
     token: Optional[str] = None
 
 
